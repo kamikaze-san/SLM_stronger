@@ -23,6 +23,7 @@ def compile_report(results_dir: Path) -> str:
     gsm8k = load_json(results_dir / "gsm8k_baseline_results.json")
     mmlu = load_json(results_dir / "mmlu_baseline_results.json")
     strategyqa = load_json(results_dir / "strategyqa_baseline_results.json")
+    strategyqa_meta = strategyqa.get("metadata", {})
     analysis_path = results_dir / "mmlu_subdomain_analysis.csv"
     if not analysis_path.exists():
         raise FileNotFoundError(f"Missing {analysis_path}. Run analyze_mmlu.py first.")
@@ -40,6 +41,8 @@ def compile_report(results_dir: Path) -> str:
         f"GSM8K Test Accuracy:      {pct(gsm8k['overall_accuracy']):>6}   (target: >88.6% pre-training, need +5% post)",
         f"MMLU Test Accuracy:       {pct(mmlu['overall_accuracy']):>6}   (target: >67.3% pre-training, need +5% post)",
         f"StrategyQA Test Accuracy: {pct(strategyqa['overall_accuracy']):>6}   (target: unknown, need +5% post)",
+        f"StrategyQA Eval Split:     {strategyqa_meta.get('split', 'unknown')}   "
+        f"(available: {strategyqa_meta.get('available_splits', 'unknown')})",
         "",
         "=== MMLU SUBDOMAIN BREAKDOWN ===",
         "Bottom 10 subdomains (most room for improvement):",

@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
-from datasets import load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -178,7 +178,7 @@ def generate_batch(
     return responses
 
 
-def make_gsm8k_examples() -> list[dict[str, Any]]:
+def make_gsm8k_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     dataset = load_dataset("gsm8k", "main", split="test")
     examples = []
     for idx, row in enumerate(dataset):
@@ -195,10 +195,10 @@ def make_gsm8k_examples() -> list[dict[str, Any]]:
                 "ground_truth": extract_gsm8k_ground_truth(row["answer"]),
             }
         )
-    return examples
+    return examples, {"dataset": "gsm8k", "config": "main", "split": "test", "n_rows": len(dataset)}
 
 
-def make_mmlu_examples() -> list[dict[str, Any]]:
+def make_mmlu_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     dataset = load_dataset("cais/mmlu", "all", split="test")
     examples = []
     for idx, row in enumerate(dataset):
@@ -223,11 +223,35 @@ def make_mmlu_examples() -> list[dict[str, Any]]:
                 "ground_truth": mmlu_answer_to_letter(row["answer"]),
             }
         )
-    return examples
+    return examples, {"dataset": "cais/mmlu", "config": "all", "split": "test", "n_rows": len(dataset)}
 
 
-def make_strategyqa_examples() -> list[dict[str, Any]]:
-    dataset = load_dataset("wics/strategy-qa", split="test")
+def choose_strategyqa_split(dataset_dict: DatasetDict, requested_split: str) -> tuple[str, str]:
+    split_sizes = {split: len(dataset) for split, dataset in dataset_dict.items()}
+    if requested_split != "auto":
+        if requested_split not in dataset_dict:
+            raise ValueError(f"Requested StrategyQA split {requested_split!r} not found. Available: {split_sizes}")
+        return requested_split, f"explicit split requested: {requested_split}"
+    near_paper_test = [split for split, size in split_sizes.items() if 450 <= size <= 530]
+    if near_paper_test:
+        return near_paper_test[0], f"auto-selected explicit paper-sized split: {near_paper_test[0]}"
+    if "test" in dataset_dict:
+        return "test", "auto-selected test split; no separate ~490-row split exists"
+    if len(dataset_dict) == 1:
+        split = next(iter(dataset_dict))
+        return split, "auto-selected only available split"
+    raise ValueError(f"Cannot auto-select StrategyQA split. Available: {split_sizes}")
+
+
+def make_strategyqa_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    dataset_obj = load_dataset("wics/strategy-qa")
+    if isinstance(dataset_obj, Dataset):
+        dataset_dict = DatasetDict({"test": dataset_obj})
+    else:
+        dataset_dict = dataset_obj
+    split_sizes = {split: len(dataset) for split, dataset in dataset_dict.items()}
+    split, split_reason = choose_strategyqa_split(dataset_dict, args.strategyqa_split)
+    dataset = dataset_dict[split]
     answer_key = "answer"
     if len(dataset) and answer_key not in dataset.column_names:
         for candidate in ("label", "target"):
@@ -250,7 +274,18 @@ def make_strategyqa_examples() -> list[dict[str, Any]]:
                 "ground_truth": normalize_bool_answer(row[answer_key]),
             }
         )
-    return examples
+    metadata = {
+        "dataset": "wics/strategy-qa",
+        "available_splits": split_sizes,
+        "split": split,
+        "split_selection_reason": split_reason,
+        "n_rows": len(dataset),
+        "contamination_note": (
+            "Only the selected split is loaded into evaluation examples. "
+            "Use the same selected split for post-training evaluation."
+        ),
+    }
+    return examples, metadata
 
 
 def evaluate_examples(
@@ -265,6 +300,7 @@ def evaluate_examples(
     save_every: int,
     extractor: Callable[[str], Any],
     comparator: Callable[[Any, Any], bool] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     final_path = output_dir / f"{benchmark}_baseline_results.json"
     checkpoint_path = output_dir / "checkpoints" / f"{benchmark}_baseline_results.jsonl"
@@ -303,16 +339,17 @@ def evaluate_examples(
             progress.update(1)
 
         if len(completed) % save_every < batch_size:
-            aggregate_and_save(benchmark, completed, final_path)
+            aggregate_and_save(benchmark, completed, final_path, metadata=metadata)
 
     progress.close()
-    return aggregate_and_save(benchmark, completed, final_path)
+    return aggregate_and_save(benchmark, completed, final_path, metadata=metadata)
 
 
 def aggregate_and_save(
     benchmark: str,
     completed: dict[str, dict[str, Any]],
     final_path: Path,
+    metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     per_example = [completed[key] for key in sorted(completed, key=lambda x: int(x))]
     n = len(per_example)
@@ -325,6 +362,7 @@ def aggregate_and_save(
         "n_examples": n,
         "n_correct": n_correct,
         "n_extraction_failed": n_failed,
+        "metadata": metadata or {},
         "per_example": per_example,
     }
     if benchmark == "mmlu":
@@ -379,7 +417,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--attn-implementation", default="sdpa", help="Options: eager, sdpa, flash_attention_2")
+    parser.add_argument("--attn-implementation", default=None, help="Optional override: eager, sdpa, flash_attention_2")
+    parser.add_argument("--strategyqa-split", default="auto", help="StrategyQA split name, or auto.")
     parser.add_argument("--gsm8k-max-new-tokens", type=int, default=MAX_NEW_TOKENS["gsm8k"])
     parser.add_argument("--mmlu-max-new-tokens", type=int, default=MAX_NEW_TOKENS["mmlu"])
     parser.add_argument("--strategyqa-max-new-tokens", type=int, default=MAX_NEW_TOKENS["strategyqa"])
@@ -415,9 +454,10 @@ def main() -> None:
     }
 
     for benchmark in args.benchmarks:
-        examples = makers[benchmark]()
+        examples, metadata = makers[benchmark](args)
         if args.limit is not None:
             examples = examples[: args.limit]
+            metadata = {**metadata, "limit": args.limit, "limited_n_rows": len(examples)}
         evaluate_examples(
             benchmark=benchmark,
             examples=examples,
@@ -430,6 +470,7 @@ def main() -> None:
             save_every=args.save_every,
             extractor=extractors[benchmark],
             comparator=comparators[benchmark],
+            metadata=metadata,
         )
 
 
