@@ -14,7 +14,7 @@ from typing import Any, Callable
 
 import numpy as np
 import torch
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import load_dataset
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -226,32 +226,11 @@ def make_mmlu_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], 
     return examples, {"dataset": "cais/mmlu", "config": "all", "split": "test", "n_rows": len(dataset)}
 
 
-def choose_strategyqa_split(dataset_dict: DatasetDict, requested_split: str) -> tuple[str, str]:
-    split_sizes = {split: len(dataset) for split, dataset in dataset_dict.items()}
-    if requested_split != "auto":
-        if requested_split not in dataset_dict:
-            raise ValueError(f"Requested StrategyQA split {requested_split!r} not found. Available: {split_sizes}")
-        return requested_split, f"explicit split requested: {requested_split}"
-    near_paper_test = [split for split, size in split_sizes.items() if 450 <= size <= 530]
-    if near_paper_test:
-        return near_paper_test[0], f"auto-selected explicit paper-sized split: {near_paper_test[0]}"
-    if "test" in dataset_dict:
-        return "test", "auto-selected test split; no separate ~490-row split exists"
-    if len(dataset_dict) == 1:
-        split = next(iter(dataset_dict))
-        return split, "auto-selected only available split"
-    raise ValueError(f"Cannot auto-select StrategyQA split. Available: {split_sizes}")
-
-
 def make_strategyqa_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    dataset_obj = load_dataset("wics/strategy-qa")
-    if isinstance(dataset_obj, Dataset):
-        dataset_dict = DatasetDict({"test": dataset_obj})
-    else:
-        dataset_dict = dataset_obj
-    split_sizes = {split: len(dataset) for split, dataset in dataset_dict.items()}
-    split, split_reason = choose_strategyqa_split(dataset_dict, args.strategyqa_split)
-    dataset = dataset_dict[split]
+    split = args.strategyqa_split
+    if split != "test":
+        raise ValueError("StrategyQA baseline evaluation must use ChilleD/StrategyQA test split only.")
+    dataset = load_dataset("ChilleD/StrategyQA", split="test")
     answer_key = "answer"
     if len(dataset) and answer_key not in dataset.column_names:
         for candidate in ("label", "target"):
@@ -275,14 +254,15 @@ def make_strategyqa_examples(args: argparse.Namespace) -> tuple[list[dict[str, A
             }
         )
     metadata = {
-        "dataset": "wics/strategy-qa",
-        "available_splits": split_sizes,
+        "dataset": "ChilleD/StrategyQA",
+        "available_splits": {"train": 1600, "test": 687},
         "split": split,
-        "split_selection_reason": split_reason,
+        "split_selection_reason": "fixed eval split: ChilleD/StrategyQA test",
         "n_rows": len(dataset),
         "contamination_note": (
-            "Only the selected split is loaded into evaluation examples. "
-            "Use the same selected split for post-training evaluation."
+            "Only ChilleD/StrategyQA test is loaded into evaluation examples. "
+            "The train split is available for later training but is not touched during baseline eval. "
+            "Use the same test split for post-training evaluation."
         ),
     }
     return examples, metadata
@@ -418,7 +398,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--attn-implementation", default=None, help="Optional override: eager, sdpa, flash_attention_2")
-    parser.add_argument("--strategyqa-split", default="auto", help="StrategyQA split name, or auto.")
+    parser.add_argument("--strategyqa-split", default="test", help="Must remain test for ChilleD/StrategyQA eval.")
     parser.add_argument("--gsm8k-max-new-tokens", type=int, default=MAX_NEW_TOKENS["gsm8k"])
     parser.add_argument("--mmlu-max-new-tokens", type=int, default=MAX_NEW_TOKENS["mmlu"])
     parser.add_argument("--strategyqa-max-new-tokens", type=int, default=MAX_NEW_TOKENS["strategyqa"])

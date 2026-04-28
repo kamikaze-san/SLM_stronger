@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Print the actual HuggingFace split layout for wics/strategy-qa."""
+"""Print the actual HuggingFace split layout for ChilleD/StrategyQA."""
 
 from datasets import load_dataset
 
 
 def main() -> None:
-    ds = load_dataset("wics/strategy-qa")
+    ds = load_dataset("ChilleD/StrategyQA")
     print(ds)
     print("\nSplit sizes:")
     for split, dataset in ds.items():
