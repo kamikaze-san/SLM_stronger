@@ -158,6 +158,7 @@ def generate_batch(
     tokenizer: Any,
     prompts: list[str],
     max_new_tokens: int,
+    debug: bool = False,
 ) -> list[str]:
     device = next(model.parameters()).device
     inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
@@ -170,8 +171,15 @@ def generate_batch(
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
-    responses: list[str] = []
     input_lengths = inputs["input_ids"].shape[1]
+    if debug:
+        print("=== FIRST PROMPT SENT TO MODEL (repr) ===")
+        print(repr(prompts[0]))
+        print("=== FIRST PROMPT SENT TO MODEL (readable) ===")
+        print(prompts[0])
+        print("=== MODEL RAW OUTPUT ===")
+        print(tokenizer.decode(outputs[0][input_lengths:], skip_special_tokens=False))
+    responses: list[str] = []
     for output in outputs:
         generated = output[input_lengths:]
         responses.append(tokenizer.decode(generated, skip_special_tokens=True).strip())
@@ -293,7 +301,8 @@ def evaluate_examples(
     for start in range(0, len(pending), batch_size):
         batch = pending[start : start + batch_size]
         prompts = [build_prompt(tokenizer, ex["prompt"]) for ex in batch]
-        responses = generate_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens)
+        debug = start == 0 and len(completed) == 0
+        responses = generate_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens, debug=debug)
         for ex, response in zip(batch, responses):
             extracted = extractor(response)
             extraction_failed = extracted is None
@@ -412,6 +421,10 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     model, tokenizer = load_model_and_tokenizer(args)
+    print("=== MODEL IDENTITY ===")
+    print(model.config._name_or_path)
+    print(model.config.architectures)
+
     makers = {
         "gsm8k": make_gsm8k_examples,
         "mmlu": make_mmlu_examples,
