@@ -153,6 +153,24 @@ def build_prompt(tokenizer: Any, user_prompt: str) -> str:
     return f"System: {SYSTEM_PROMPT}\n\nUser: {user_prompt}\n\nAssistant:"
 
 
+def get_eos_token_ids(tokenizer: Any) -> list[int]:
+    ids = []
+    if tokenizer.eos_token_id is not None:
+        ids.append(tokenizer.eos_token_id)
+    for token in ("<|end|>", "<|endoftext|>", "<|im_end|>"):
+        tid = tokenizer.convert_tokens_to_ids(token)
+        if tid is not None and tid != tokenizer.unk_token_id and tid not in ids:
+            ids.append(tid)
+    return ids
+
+
+def truncate_at_stop_token(text: str) -> str:
+    for marker in ("<|end|>", "<|endoftext|>", "<|im_end|>", "<|user|>", "<|assistant|>"):
+        if marker in text:
+            text = text[: text.index(marker)]
+    return text.strip()
+
+
 def generate_batch(
     model: Any,
     tokenizer: Any,
@@ -162,14 +180,15 @@ def generate_batch(
 ) -> list[str]:
     device = next(model.parameters()).device
     inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
+    eos_ids = get_eos_token_ids(tokenizer)
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             temperature=1.0,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=eos_ids,
         )
     input_lengths = inputs["input_ids"].shape[1]
     if debug:
@@ -182,7 +201,8 @@ def generate_batch(
     responses: list[str] = []
     for output in outputs:
         generated = output[input_lengths:]
-        responses.append(tokenizer.decode(generated, skip_special_tokens=True).strip())
+        raw = tokenizer.decode(generated, skip_special_tokens=False)
+        responses.append(truncate_at_stop_token(raw))
     return responses
 
 
@@ -191,7 +211,6 @@ def make_gsm8k_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
     examples = []
     for idx, row in enumerate(dataset):
         prompt = (
-            "Think through this step by step.\n\n"
             f"Question: {row['question']}\n\n"
             "Show your reasoning, then give your final answer as a number."
         )
@@ -212,7 +231,6 @@ def make_mmlu_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], 
     for idx, row in enumerate(dataset):
         choices = list(row["choices"])
         prompt = (
-            "Think through this step by step.\n\n"
             f"Question: {row['question']}\n\n"
             "Options:\n"
             f"A) {choices[0]}\n"
@@ -248,10 +266,8 @@ def make_strategyqa_examples(args: argparse.Namespace) -> tuple[list[dict[str, A
     examples = []
     for idx, row in enumerate(dataset):
         prompt = (
-            "Think through this step by step.\n\n"
             f"Question: {row['question']}\n\n"
-            "Think about what facts you need to answer this, then answer\n"
-            "with only Yes or No."
+            "Think about what facts you need to answer this, then answer with only Yes or No."
         )
         examples.append(
             {
