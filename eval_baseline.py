@@ -91,34 +91,67 @@ def normalize_number(text: Any) -> float | None:
         return None
 
 
-def extract_last_number(response: str) -> float | None:
-    return normalize_number(response.replace("$", " "))
-
-
 def extract_gsm8k_ground_truth(answer: str) -> float | None:
     if "####" in answer:
         return normalize_number(answer.split("####")[-1])
     return normalize_number(answer)
 
 
-def extract_mmlu_answer(response: str) -> str | None:
-    patterns = [
-        r"(?:answer\s+is|answer:|final\s+answer\s+is|final\s+answer:)\s*\(?\s*([ABCD])\s*\)?",
-        r"(?:option|choice)\s*([ABCD])\b",
-        r"\b([ABCD])\s*(?:is|seems|appears)\s+correct\b",
-        r"\(([ABCD])\)",
-        r"\b([ABCD])\)",
-    ]
-    found: list[str] = []
-    for pattern in patterns:
-        found.extend(re.findall(pattern, response, flags=re.IGNORECASE))
-    standalone = re.findall(r"(?<![A-Za-z])([ABCD])(?![A-Za-z])", response)
-    found.extend(standalone)
+def extract_answer_tag(response: str) -> str | None:
+    m = re.search(r"<answer>(.*?)</answer>", response, re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def extract_answer_line(response: str) -> str | None:
+    """Extract the value after a bare 'Answer:' line."""
+    m = re.search(r"(?:^|\n)\s*Answer:\s*(.+)", response, re.IGNORECASE)
+    return m.group(1).strip() if m else None
+
+
+def extract_gsm8k(response: str) -> float | None:
+    # Prefer <answer> tag, then Answer: line, then last number
+    tag = extract_answer_tag(response)
+    if tag is not None:
+        result = normalize_number(tag.replace("$", " "))
+        if result is not None:
+            return result
+    line = extract_answer_line(response)
+    if line is not None:
+        result = normalize_number(line.replace("$", " "))
+        if result is not None:
+            return result
+    return normalize_number(response.replace("$", " "))
+
+
+def extract_mmlu(response: str) -> str | None:
+    # Prefer <answer> tag, then Answer: line, then last standalone letter
+    tag = extract_answer_tag(response)
+    if tag is not None:
+        m = re.search(r"\b([ABCD])\b", tag, re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+    line = extract_answer_line(response)
+    if line is not None:
+        m = re.search(r"\b([ABCD])\b", line, re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+    found = re.findall(r"(?<![A-Za-z])([ABCD])(?![A-Za-z])", response)
     return found[-1].upper() if found else None
 
 
-def extract_yes_no(response: str) -> str | None:
-    found = re.findall(r"\b(yes|no)\b", response, flags=re.IGNORECASE)
+def extract_strategyqa(response: str) -> str | None:
+    # Prefer <answer> tag, then Answer: line, then last yes/no
+    tag = extract_answer_tag(response)
+    if tag is not None:
+        m = re.search(r"\b(yes|no)\b", tag, re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
+    line = extract_answer_line(response)
+    if line is not None:
+        m = re.search(r"\b(yes|no)\b", line, re.IGNORECASE)
+        if m:
+            return m.group(1).lower()
+    found = re.findall(r"\b(yes|no)\b", response, re.IGNORECASE)
     return found[-1].lower() if found else None
 
 
@@ -212,7 +245,7 @@ def make_gsm8k_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
     for idx, row in enumerate(dataset):
         prompt = (
             f"Question: {row['question']}\n\n"
-            "Show your reasoning, then give your final answer as a number."
+            "Show your reasoning, then on the last line write only: Answer: [number]"
         )
         examples.append(
             {
@@ -237,8 +270,7 @@ def make_mmlu_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], 
             f"B) {choices[1]}\n"
             f"C) {choices[2]}\n"
             f"D) {choices[3]}\n\n"
-            "Choose the correct option. Give your reasoning first,\n"
-            "then state your final answer as a single letter: A, B, C, or D."
+            "Give your reasoning first, then on the last line write only: Answer: [letter]"
         )
         examples.append(
             {
@@ -267,7 +299,9 @@ def make_strategyqa_examples(args: argparse.Namespace) -> tuple[list[dict[str, A
     for idx, row in enumerate(dataset):
         prompt = (
             f"Question: {row['question']}\n\n"
-            "Think about what facts you need to answer this, then answer with only Yes or No."
+            "Think about what facts you need to answer this. Work through the reasoning, "
+            "then commit to a final answer. Do not hedge — give your best judgment. "
+            "On the last line write only: Answer: Yes or Answer: No"
         )
         examples.append(
             {
@@ -447,9 +481,9 @@ def main() -> None:
         "strategyqa": make_strategyqa_examples,
     }
     extractors = {
-        "gsm8k": extract_last_number,
-        "mmlu": extract_mmlu_answer,
-        "strategyqa": extract_yes_no,
+        "gsm8k": extract_gsm8k,
+        "mmlu": extract_mmlu,
+        "strategyqa": extract_strategyqa,
     }
     token_limits = {
         "gsm8k": args.gsm8k_max_new_tokens,
