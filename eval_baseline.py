@@ -9,6 +9,7 @@ import math
 import os
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -109,49 +110,52 @@ def extract_answer_line(response: str) -> str | None:
 
 
 def extract_gsm8k(response: str) -> float | None:
-    # Prefer <answer> tag, then Answer: line, then last number
-    tag = extract_answer_tag(response)
+    # Strip <think> block, then prefer <answer> tag, then Answer: line, then last number
+    text = strip_think_block(response)
+    tag = extract_answer_tag(text)
     if tag is not None:
         result = normalize_number(tag.replace("$", " "))
         if result is not None:
             return result
-    line = extract_answer_line(response)
+    line = extract_answer_line(text)
     if line is not None:
         result = normalize_number(line.replace("$", " "))
         if result is not None:
             return result
-    return normalize_number(response.replace("$", " "))
+    return normalize_number(text.replace("$", " "))
 
 
 def extract_mmlu(response: str) -> str | None:
-    # Prefer <answer> tag, then Answer: line, then last standalone letter
-    tag = extract_answer_tag(response)
+    # Strip <think> block, then prefer <answer> tag, then Answer: line, then last standalone letter
+    text = strip_think_block(response)
+    tag = extract_answer_tag(text)
     if tag is not None:
         m = re.search(r"\b([ABCD])\b", tag, re.IGNORECASE)
         if m:
             return m.group(1).upper()
-    line = extract_answer_line(response)
+    line = extract_answer_line(text)
     if line is not None:
         m = re.search(r"\b([ABCD])\b", line, re.IGNORECASE)
         if m:
             return m.group(1).upper()
-    found = re.findall(r"(?<![A-Za-z])([ABCD])(?![A-Za-z])", response)
+    found = re.findall(r"(?<![A-Za-z])([ABCD])(?![A-Za-z])", text)
     return found[-1].upper() if found else None
 
 
 def extract_strategyqa(response: str) -> str | None:
-    # Prefer <answer> tag, then Answer: line, then last yes/no
-    tag = extract_answer_tag(response)
+    # Strip <think> block, then prefer <answer> tag, then Answer: line, then last yes/no
+    text = strip_think_block(response)
+    tag = extract_answer_tag(text)
     if tag is not None:
         m = re.search(r"\b(yes|no)\b", tag, re.IGNORECASE)
         if m:
             return m.group(1).lower()
-    line = extract_answer_line(response)
+    line = extract_answer_line(text)
     if line is not None:
         m = re.search(r"\b(yes|no)\b", line, re.IGNORECASE)
         if m:
             return m.group(1).lower()
-    found = re.findall(r"\b(yes|no)\b", response, re.IGNORECASE)
+    found = re.findall(r"\b(yes|no)\b", text, re.IGNORECASE)
     return found[-1].lower() if found else None
 
 
@@ -204,16 +208,23 @@ def truncate_at_stop_token(text: str) -> str:
     return text.strip()
 
 
+def strip_think_block(text: str) -> str:
+    """Return text after </think>; falls back to full text if tag absent."""
+    m = re.search(r"</think>(.*)", text, re.DOTALL | re.IGNORECASE)
+    return m.group(1).strip() if m else text
+
+
 def generate_batch(
     model: Any,
     tokenizer: Any,
     prompts: list[str],
     max_new_tokens: int,
     debug: bool = False,
-) -> list[str]:
+) -> tuple[list[str], list[dict[str, float]]]:
     device = next(model.parameters()).device
     inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
     eos_ids = get_eos_token_ids(tokenizer)
+    t0 = time.perf_counter()
     with torch.inference_mode():
         outputs = model.generate(
             **inputs,
@@ -223,6 +234,7 @@ def generate_batch(
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=eos_ids,
         )
+    elapsed = time.perf_counter() - t0
     input_lengths = inputs["input_ids"].shape[1]
     if debug:
         print("=== FIRST PROMPT SENT TO MODEL (repr) ===")
@@ -232,11 +244,21 @@ def generate_batch(
         print("=== MODEL RAW OUTPUT ===")
         print(tokenizer.decode(outputs[0][input_lengths:], skip_special_tokens=False))
     responses: list[str] = []
+    latencies: list[dict[str, float]] = []
+    n = len(prompts)
     for output in outputs:
         generated = output[input_lengths:]
+        # Exclude trailing pad tokens from token count
+        n_tokens = int((generated != tokenizer.pad_token_id).sum().item())
         raw = tokenizer.decode(generated, skip_special_tokens=False)
         responses.append(truncate_at_stop_token(raw))
-    return responses
+        latency_s = elapsed / n
+        latencies.append({
+            "latency_seconds": round(latency_s, 4),
+            "tokens_generated": n_tokens,
+            "tokens_per_second": round(n_tokens / latency_s, 2) if latency_s > 0 else 0.0,
+        })
+    return responses, latencies
 
 
 def make_gsm8k_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -352,8 +374,8 @@ def evaluate_examples(
         batch = pending[start : start + batch_size]
         prompts = [build_prompt(tokenizer, ex["prompt"]) for ex in batch]
         debug = start == 0 and len(completed) == 0
-        responses = generate_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens, debug=debug)
-        for ex, response in zip(batch, responses):
+        responses, latencies = generate_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens, debug=debug)
+        for ex, response, lat in zip(batch, responses, latencies):
             extracted = extractor(response)
             extraction_failed = extracted is None
             if extraction_failed:
@@ -370,6 +392,7 @@ def evaluate_examples(
                 "ground_truth": ex["ground_truth"],
                 "correct": correct,
                 "extraction_failed": extraction_failed,
+                **lat,
             }
             if "subject" in ex:
                 row["subject"] = ex["subject"]
@@ -384,6 +407,26 @@ def evaluate_examples(
     return aggregate_and_save(benchmark, completed, final_path, metadata=metadata)
 
 
+def compute_latency_summary(per_example: list[dict[str, Any]]) -> dict[str, Any]:
+    rows_with_lat = [r for r in per_example if "latency_seconds" in r]
+    if not rows_with_lat:
+        return {}
+    lats = sorted(r["latency_seconds"] for r in rows_with_lat)
+    toks = sorted(r["tokens_generated"] for r in rows_with_lat)
+    tps_vals = [r["tokens_per_second"] for r in rows_with_lat]
+    n = len(rows_with_lat)
+    return {
+        "n": n,
+        "latency_mean_s": round(sum(lats) / n, 4),
+        "latency_p50_s": round(lats[n // 2], 4),
+        "latency_p95_s": round(lats[int(n * 0.95)], 4),
+        "tokens_mean": round(sum(toks) / n, 1),
+        "tokens_p50": toks[n // 2],
+        "tokens_p95": toks[int(n * 0.95)],
+        "tokens_per_second_mean": round(sum(tps_vals) / n, 2),
+    }
+
+
 def aggregate_and_save(
     benchmark: str,
     completed: dict[str, dict[str, Any]],
@@ -394,6 +437,7 @@ def aggregate_and_save(
     n = len(per_example)
     n_correct = sum(bool(row["correct"]) for row in per_example)
     n_failed = sum(bool(row.get("extraction_failed", False)) for row in per_example)
+    latency_summary = compute_latency_summary(per_example)
     result: dict[str, Any] = {
         "benchmark": benchmark,
         "overall_accuracy": n_correct / n if n else math.nan,
@@ -401,6 +445,7 @@ def aggregate_and_save(
         "n_examples": n,
         "n_correct": n_correct,
         "n_extraction_failed": n_failed,
+        "latency_summary": latency_summary,
         "metadata": metadata or {},
         "per_example": per_example,
     }
@@ -413,6 +458,15 @@ def aggregate_and_save(
             for subject, rows in sorted(by_subject.items())
         }
     atomic_write_json(final_path, result)
+    if latency_summary:
+        print(
+            f"\n=== LATENCY SUMMARY: {benchmark} (n={latency_summary['n']}) ===\n"
+            f"  Mean latency/q:   {latency_summary['latency_mean_s']:.2f}s  "
+            f"(p95: {latency_summary['latency_p95_s']:.2f}s)\n"
+            f"  Mean tokens gen:  {latency_summary['tokens_mean']:.0f}  "
+            f"(p95: {latency_summary['tokens_p95']})\n"
+            f"  Tokens/sec:       {latency_summary['tokens_per_second_mean']:.1f}"
+        )
     return result
 
 
