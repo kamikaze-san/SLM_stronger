@@ -153,15 +153,16 @@ def plot_breakdown(df: pd.DataFrame, output_path: Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=Path("results/mmlu_baseline_results.json"))
-    parser.add_argument("--output-dir", type=Path, default=Path("results"))
+    parser.add_argument("--output-dir", type=Path, default=None)
     parser.add_argument("--category-overrides", type=Path, default=Path("mmlu_category_overrides.json"))
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    df = analyze(args.input, args.output_dir, args.category_overrides)
+    output_dir = args.output_dir or args.input.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    df = analyze(args.input, output_dir, args.category_overrides)
     print(df.to_string(index=False, formatters={"accuracy": "{:.3f}".format, "gap_to_70pct": "{:.3f}".format}))
 
 
