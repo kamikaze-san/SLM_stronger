@@ -515,7 +515,7 @@ def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
         for model_cls in model_classes:
             try:
                 return model_cls.from_pretrained(args.model_name, **kwargs, **extra)
-            except ValueError:
+            except (ValueError, ImportError):
                 continue
         return None
 
