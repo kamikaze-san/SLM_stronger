@@ -202,7 +202,7 @@ def get_eos_token_ids(tokenizer: Any) -> list[int]:
 
 
 def truncate_at_stop_token(text: str) -> str:
-    for marker in ("<|end|>", "<|endoftext|>", "<|im_end|>", "<|user|>", "<|assistant|>"):
+    for marker in ("<|end|>", "<|endoftext|>", "<|im_end|>", "<|user|>", "<|assistant|>", "</s>", "[/INST]"):
         if marker in text:
             text = text[: text.index(marker)]
     return text.strip()
