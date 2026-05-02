@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 
 MODEL_NAME = "microsoft/Phi-4-mini-instruct"
@@ -209,7 +209,12 @@ def truncate_at_stop_token(text: str) -> str:
 
 
 def strip_think_block(text: str) -> str:
-    """Return text after </think>; falls back to full text if tag absent."""
+    """Return text after </think> or Gemma's <channel|>; falls back to full text."""
+    # Gemma 4: <|channel>thought\n...<channel|>
+    m = re.search(r"<channel\|>(.*)", text, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Standard <think>...</think>
     m = re.search(r"</think>(.*)", text, re.DOTALL | re.IGNORECASE)
     return m.group(1).strip() if m else text
 
@@ -471,7 +476,13 @@ def aggregate_and_save(
 
 
 def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+    # Try AutoProcessor first (multimodal models like Gemma 4), fall back to AutoTokenizer
+    try:
+        processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+    except Exception:
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
