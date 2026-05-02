@@ -476,11 +476,20 @@ def aggregate_and_save(
 
 
 def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
-    # Try AutoProcessor first (multimodal models like Gemma 4), fall back to AutoTokenizer
+    # Try loaders in order: AutoProcessor, MistralCommonBackend, AutoTokenizer
+    tokenizer = None
     try:
         processor = AutoProcessor.from_pretrained(args.model_name, trust_remote_code=True)
         tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
     except Exception:
+        pass
+    if tokenizer is None:
+        try:
+            from transformers import MistralCommonBackend
+            tokenizer = MistralCommonBackend.from_pretrained(args.model_name)
+        except (ImportError, Exception):
+            pass
+    if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
 
     if tokenizer.pad_token is None:
@@ -497,7 +506,7 @@ def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
 
     import transformers as _tf
     model_classes = [AutoModelForCausalLM]
-    for cls_name in ("AutoModelForVision2Seq", "AutoModelForImageTextToText"):
+    for cls_name in ("AutoModelForVision2Seq", "AutoModelForImageTextToText", "Mistral3ForConditionalGeneration"):
         cls = getattr(_tf, cls_name, None)
         if cls is not None:
             model_classes.append(cls)
