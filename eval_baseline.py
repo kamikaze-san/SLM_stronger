@@ -511,13 +511,24 @@ def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
         if cls is not None:
             model_classes.append(cls)
 
-    for model_cls in model_classes:
+    def _try_load(extra: dict) -> Any:
+        for model_cls in model_classes:
+            try:
+                return model_cls.from_pretrained(args.model_name, **kwargs, **extra)
+            except ValueError:
+                continue
+        return None
+
+    model = _try_load({})
+    if model is None:
+        # Try dequantizing FP8 to bfloat16 for models that require FP8 kernels
         try:
-            model = model_cls.from_pretrained(args.model_name, **kwargs)
-            break
-        except ValueError:
-            continue
-    else:
+            from transformers import FineGrainedFP8Config
+            print("Retrying with FineGrainedFP8Config(dequantize=True) ...")
+            model = _try_load({"quantization_config": FineGrainedFP8Config(dequantize=True)})
+        except (ImportError, Exception):
+            pass
+    if model is None:
         raise RuntimeError(f"Could not load {args.model_name} with any supported AutoModel class.")
 
     model.eval()
