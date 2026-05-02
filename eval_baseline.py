@@ -17,7 +17,7 @@ import numpy as np
 import torch
 from datasets import load_dataset
 from tqdm.auto import tqdm
-from transformers import AutoModelForCausalLM, AutoModelForVision2Seq, AutoProcessor, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
 
 
 MODEL_NAME = "microsoft/Phi-4-mini-instruct"
@@ -495,7 +495,14 @@ def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
     if args.attn_implementation:
         kwargs["attn_implementation"] = args.attn_implementation
 
-    for model_cls in (AutoModelForCausalLM, AutoModelForVision2Seq):
+    import transformers as _tf
+    model_classes = [AutoModelForCausalLM]
+    for cls_name in ("AutoModelForVision2Seq", "AutoModelForImageTextToText"):
+        cls = getattr(_tf, cls_name, None)
+        if cls is not None:
+            model_classes.append(cls)
+
+    for model_cls in model_classes:
         try:
             model = model_cls.from_pretrained(args.model_name, **kwargs)
             break
