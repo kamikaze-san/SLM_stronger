@@ -180,13 +180,19 @@ def normalize_bool_answer(answer: Any) -> str:
     raise ValueError(f"Cannot normalize StrategyQA answer: {answer!r}")
 
 
-def build_prompt(tokenizer: Any, user_prompt: str) -> str:
+def build_prompt(tokenizer: Any, user_prompt: str, no_think: bool = False) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_prompt},
     ]
     if getattr(tokenizer, "chat_template", None):
-        return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
+        if no_think:
+            try:
+                return tokenizer.apply_chat_template(messages, **kwargs, enable_thinking=False)
+            except TypeError:
+                pass  # tokenizer doesn't support enable_thinking, fall through
+        return tokenizer.apply_chat_template(messages, **kwargs)
     return f"System: {SYSTEM_PROMPT}\n\nUser: {user_prompt}\n\nAssistant:"
 
 
@@ -366,6 +372,7 @@ def evaluate_examples(
     extractor: Callable[[str], Any],
     comparator: Callable[[Any, Any], bool] | None = None,
     metadata: dict[str, Any] | None = None,
+    no_think: bool = False,
 ) -> dict[str, Any]:
     final_path = output_dir / f"{benchmark}_baseline_results.json"
     checkpoint_path = output_dir / "checkpoints" / f"{benchmark}_baseline_results.jsonl"
@@ -377,7 +384,7 @@ def evaluate_examples(
 
     for start in range(0, len(pending), batch_size):
         batch = pending[start : start + batch_size]
-        prompts = [build_prompt(tokenizer, ex["prompt"]) for ex in batch]
+        prompts = [build_prompt(tokenizer, ex["prompt"], no_think=no_think) for ex in batch]
         debug = start == 0 and len(completed) == 0
         responses, latencies = generate_batch(model, tokenizer, prompts, max_new_tokens=max_new_tokens, debug=debug)
         for ex, response, lat in zip(batch, responses, latencies):
@@ -562,6 +569,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mmlu-max-new-tokens", type=int, default=MAX_NEW_TOKENS["mmlu"])
     parser.add_argument("--strategyqa-max-new-tokens", type=int, default=MAX_NEW_TOKENS["strategyqa"])
     parser.add_argument("--limit", type=int, default=None, help="Optional smoke-test limit per benchmark.")
+    parser.add_argument("--no-think", action="store_true", default=False, help="Disable thinking mode (Qwen3 and similar).")
     return parser.parse_args()
 
 
@@ -614,6 +622,7 @@ def main() -> None:
             extractor=extractors[benchmark],
             comparator=comparators[benchmark],
             metadata=metadata,
+            no_think=args.no_think,
         )
 
 
