@@ -273,7 +273,8 @@ def generate_batch(
 
 
 def make_gsm8k_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    dataset = load_dataset("gsm8k", "main", split="test")
+    split = args.gsm8k_split
+    dataset = load_dataset("gsm8k", "main", split=split)
     examples = []
     for idx, row in enumerate(dataset):
         prompt = (
@@ -288,13 +289,25 @@ def make_gsm8k_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]],
                 "ground_truth": extract_gsm8k_ground_truth(row["answer"]),
             }
         )
-    return examples, {"dataset": "gsm8k", "config": "main", "split": "test", "n_rows": len(dataset)}
+    return examples, {"dataset": "gsm8k", "config": "main", "split": split, "n_rows": len(dataset)}
+
+
+MMLU_REASONING_SUBDOMAINS = {
+    "abstract_algebra", "college_mathematics", "formal_logic",
+    "econometrics", "machine_learning", "college_physics",
+    "college_chemistry", "college_computer_science",
+    "high_school_mathematics", "high_school_physics",
+    "electrical_engineering", "college_biology",
+}
 
 
 def make_mmlu_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    dataset = load_dataset("cais/mmlu", "all", split="test")
+    split = args.mmlu_split
+    dataset = load_dataset("cais/mmlu", "all", split=split)
     examples = []
     for idx, row in enumerate(dataset):
+        if args.mmlu_reasoning_only and row["subject"] not in MMLU_REASONING_SUBDOMAINS:
+            continue
         choices = list(row["choices"])
         prompt = (
             f"Question: {row['question']}\n\n"
@@ -314,14 +327,15 @@ def make_mmlu_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], 
                 "ground_truth": mmlu_answer_to_letter(row["answer"]),
             }
         )
-    return examples, {"dataset": "cais/mmlu", "config": "all", "split": "test", "n_rows": len(dataset)}
+    return examples, {
+        "dataset": "cais/mmlu", "config": "all", "split": split,
+        "reasoning_only": args.mmlu_reasoning_only, "n_rows": len(examples),
+    }
 
 
 def make_strategyqa_examples(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     split = args.strategyqa_split
-    if split != "test":
-        raise ValueError("StrategyQA baseline evaluation must use ChilleD/StrategyQA test split only.")
-    dataset = load_dataset("ChilleD/StrategyQA", split="test")
+    dataset = load_dataset("ChilleD/StrategyQA", split=split)
     answer_key = "answer"
     if len(dataset) and answer_key not in dataset.column_names:
         for candidate in ("label", "target"):
@@ -348,13 +362,7 @@ def make_strategyqa_examples(args: argparse.Namespace) -> tuple[list[dict[str, A
         "dataset": "ChilleD/StrategyQA",
         "available_splits": {"train": 1600, "test": 687},
         "split": split,
-        "split_selection_reason": "fixed eval split: ChilleD/StrategyQA test",
         "n_rows": len(dataset),
-        "contamination_note": (
-            "Only ChilleD/StrategyQA test is loaded into evaluation examples. "
-            "The train split is available for later training but is not touched during baseline eval. "
-            "Use the same test split for post-training evaluation."
-        ),
     }
     return examples, metadata
 
@@ -564,7 +572,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--attn-implementation", default=None, help="Optional override: eager, sdpa, flash_attention_2")
-    parser.add_argument("--strategyqa-split", default="test", help="Must remain test for ChilleD/StrategyQA eval.")
+    parser.add_argument("--gsm8k-split", default="test", choices=["train", "test"], help="GSM8K split to evaluate.")
+    parser.add_argument("--mmlu-split", default="test", choices=["test", "validation", "auxiliary_train"], help="MMLU split to evaluate.")
+    parser.add_argument("--mmlu-reasoning-only", action="store_true", default=False, help="Filter MMLU to reasoning subdomains only (for data curation).")
+    parser.add_argument("--strategyqa-split", default="test", choices=["train", "test"], help="StrategyQA split to evaluate.")
     parser.add_argument("--gsm8k-max-new-tokens", type=int, default=MAX_NEW_TOKENS["gsm8k"])
     parser.add_argument("--mmlu-max-new-tokens", type=int, default=MAX_NEW_TOKENS["mmlu"])
     parser.add_argument("--strategyqa-max-new-tokens", type=int, default=MAX_NEW_TOKENS["strategyqa"])
