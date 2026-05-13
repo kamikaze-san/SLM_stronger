@@ -21,6 +21,7 @@ import json
 import math
 import random
 import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -332,13 +333,16 @@ def main() -> None:
 
     pbar = tqdm(total=args.max_steps, initial=opt_step, desc="OPD")
 
+    _diag_iterations = 0
     while opt_step < args.max_steps:
         q = random.choice(questions)
         prompt = build_prompt(tokenizer, q["question"], args.no_think)
 
+        _t0 = time.perf_counter()
         full_ids, prompt_len = generate_rollout(
             student, tokenizer, prompt, args.max_new_tokens, eos_ids
         )
+        _gen_t = time.perf_counter() - _t0
 
         if full_ids.shape[0] <= prompt_len:
             continue
@@ -349,8 +353,18 @@ def main() -> None:
             window["skipped"] += 1
             continue
 
+        _t0 = time.perf_counter()
         loss = reverse_kl_loss(student, teacher, full_ids, prompt_len)
+        _fwd_t = time.perf_counter() - _t0
+
+        _t0 = time.perf_counter()
         (loss / args.grad_accum).backward()
+        _bwd_t = time.perf_counter() - _t0
+
+        if _diag_iterations < 3:
+            n_gen = full_ids.shape[0] - prompt_len
+            print(f"[diag] tokens={n_gen}  gen={_gen_t:.1f}s  fwd={_fwd_t:.1f}s  bwd={_bwd_t:.1f}s  total={_gen_t+_fwd_t+_bwd_t:.1f}s")
+            _diag_iterations += 1
         accum_count += 1
         window["trained"] += 1
         window["loss_sum"] += loss.item()
