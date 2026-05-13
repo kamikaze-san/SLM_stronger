@@ -151,6 +151,10 @@ def main() -> None:
     train_raw = load_jsonl(args.train_data)
     val_raw = load_jsonl(args.val_data)
 
+    # Normalize ground_truth to string to avoid pyarrow mixed-type errors
+    for row in train_raw + val_raw:
+        row["ground_truth"] = str(row.get("ground_truth", ""))
+
     def tokenize(example: dict) -> dict:
         return tokenize_with_loss_mask(example, tokenizer, args.max_length)
 
