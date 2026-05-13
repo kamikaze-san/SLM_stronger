@@ -307,7 +307,30 @@ def main() -> None:
     optimizer.zero_grad()
     accum_count = 0
     opt_step = 0
-    pbar = tqdm(total=args.max_steps, desc="OPD")
+
+    # Resume from latest checkpoint if available
+    ckpt_dirs = sorted(args.output_dir.glob("step_*"),
+                       key=lambda p: int(p.name.split("_")[1]))
+    if ckpt_dirs:
+        latest = ckpt_dirs[-1]
+        state_file = latest / "trainer_state.pt"
+        if state_file.exists():
+            print(f"Resuming from {latest} ...")
+            state = torch.load(state_file, map_location="cpu")
+            opt_step = state["opt_step"]
+            optimizer.load_state_dict(state["optimizer"])
+            scheduler.load_state_dict(state["scheduler"])
+            torch.set_rng_state(state["rng"])
+            # Reload LoRA weights from checkpoint
+            from peft import set_peft_model_state_dict
+            from safetensors.torch import load_file
+            adapter_path = latest / "adapter_model.safetensors"
+            if adapter_path.exists():
+                adapter_weights = load_file(str(adapter_path))
+                set_peft_model_state_dict(student, adapter_weights)
+            print(f"Resumed at step {opt_step}")
+
+    pbar = tqdm(total=args.max_steps, initial=opt_step, desc="OPD")
 
     while opt_step < args.max_steps:
         q = random.choice(questions)
@@ -361,6 +384,12 @@ def main() -> None:
                 ckpt = args.output_dir / f"step_{opt_step}"
                 student.save_pretrained(str(ckpt))
                 tokenizer.save_pretrained(str(ckpt))
+                torch.save({
+                    "opt_step": opt_step,
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "rng": torch.get_rng_state(),
+                }, ckpt / "trainer_state.pt")
                 print(f"\nSaved checkpoint: {ckpt}")
 
     pbar.close()
