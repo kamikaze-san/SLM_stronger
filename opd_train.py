@@ -181,19 +181,19 @@ def build_prompt(tokenizer: Any, question: str, no_think: bool) -> str:
 
 # ── Core OPD computation ───────────────────────────────────────────────────────
 
-def generate_rollout(
+def generate_rollouts_batch(
     model: Any,
     tokenizer: Any,
-    prompt: str,
+    prompts: list[str],
     max_new_tokens: int,
     eos_ids: list[int],
-) -> tuple[torch.Tensor, int]:
-    """Returns (full_ids_cpu_1d, prompt_len)."""
+) -> list[tuple[torch.Tensor, int]]:
+    """Generate a batch of rollouts. Returns list of (full_ids_cpu_1d, prompt_len)."""
     device = next(model.parameters()).device
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
     prompt_len = inputs["input_ids"].shape[1]
     with torch.no_grad():
-        output = model.generate(
+        outputs = model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=True,
@@ -202,7 +202,7 @@ def generate_rollout(
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=eos_ids,
         )
-    return output[0].cpu(), prompt_len
+    return [(outputs[i].cpu(), prompt_len) for i in range(len(prompts))]
 
 
 def reverse_kl_loss(
@@ -253,7 +253,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-accum", type=int, default=8,
                         help="Gradient accumulation over incorrect rollouts before optimizer step.")
     parser.add_argument("--lr", type=float, default=5e-6)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--gen-batch-size", type=int, default=4,
+                        help="Rollouts to generate in one forward pass. Reduce if OOM during generation.")
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--save-steps", type=int, default=200)
@@ -333,78 +335,93 @@ def main() -> None:
 
     pbar = tqdm(total=args.max_steps, initial=opt_step, desc="OPD")
 
-    _diag_iterations = 0
+    _diag_done = False
     while opt_step < args.max_steps:
-        q = random.choice(questions)
-        prompt = build_prompt(tokenizer, q["question"], args.no_think)
+        # Sample a batch of questions and generate all rollouts at once
+        batch_qs = [random.choice(questions) for _ in range(args.gen_batch_size)]
+        prompts = [build_prompt(tokenizer, q["question"], args.no_think) for q in batch_qs]
 
         _t0 = time.perf_counter()
-        full_ids, prompt_len = generate_rollout(
-            student, tokenizer, prompt, args.max_new_tokens, eos_ids
-        )
+        try:
+            rollouts = generate_rollouts_batch(
+                student, tokenizer, prompts, args.max_new_tokens, eos_ids
+            )
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            # Fallback: generate one at a time
+            rollouts = []
+            for prompt in prompts:
+                try:
+                    r = generate_rollouts_batch(student, tokenizer, [prompt], args.max_new_tokens, eos_ids)
+                    rollouts.extend(r)
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
         _gen_t = time.perf_counter() - _t0
 
-        if full_ids.shape[0] <= prompt_len:
-            continue
+        _fwd_bwd_t = 0.0
+        for q, (full_ids, prompt_len) in zip(batch_qs, rollouts):
+            if full_ids.shape[0] <= prompt_len:
+                continue
 
-        response = tokenizer.decode(full_ids[prompt_len:], skip_special_tokens=True)
+            response = tokenizer.decode(full_ids[prompt_len:], skip_special_tokens=True)
 
-        if check_correct(response, q):
-            window["skipped"] += 1
-            continue
+            if check_correct(response, q):
+                window["skipped"] += 1
+                continue
 
-        _t0 = time.perf_counter()
-        loss = reverse_kl_loss(student, teacher, full_ids, prompt_len)
-        _fwd_t = time.perf_counter() - _t0
+            _t0 = time.perf_counter()
+            loss = reverse_kl_loss(student, teacher, full_ids, prompt_len)
+            (loss / args.grad_accum).backward()
+            _fwd_bwd_t += time.perf_counter() - _t0
 
-        _t0 = time.perf_counter()
-        (loss / args.grad_accum).backward()
-        _bwd_t = time.perf_counter() - _t0
+            accum_count += 1
+            window["trained"] += 1
+            window["loss_sum"] += loss.item()
 
-        if _diag_iterations < 3:
-            n_gen = full_ids.shape[0] - prompt_len
-            print(f"[diag] tokens={n_gen}  gen={_gen_t:.1f}s  fwd={_fwd_t:.1f}s  bwd={_bwd_t:.1f}s  total={_gen_t+_fwd_t+_bwd_t:.1f}s")
-            _diag_iterations += 1
-        accum_count += 1
-        window["trained"] += 1
-        window["loss_sum"] += loss.item()
+            if accum_count >= args.grad_accum:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in student.parameters() if p.requires_grad], 1.0
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                accum_count = 0
+                opt_step += 1
+                pbar.update(1)
 
-        if accum_count >= args.grad_accum:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in student.parameters() if p.requires_grad], 1.0
-            )
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
-            accum_count = 0
-            opt_step += 1
-            pbar.update(1)
+                if opt_step % args.logging_steps == 0:
+                    avg_loss = window["loss_sum"] / max(1, window["trained"])
+                    total_seen = window["skipped"] + window["trained"]
+                    skip_rate = window["skipped"] / max(1, total_seen)
+                    log_row = {
+                        "step": opt_step,
+                        "loss": round(avg_loss, 4),
+                        "skip_rate": round(skip_rate, 3),
+                        "lr": optimizer.param_groups[0]["lr"],
+                    }
+                    append_jsonl(log_path, log_row)
+                    pbar.set_postfix(loss=f"{avg_loss:.4f}", skip=f"{skip_rate:.1%}")
+                    window = {"skipped": 0, "trained": 0, "loss_sum": 0.0}
 
-            if opt_step % args.logging_steps == 0:
-                avg_loss = window["loss_sum"] / max(1, window["trained"])
-                total_seen = window["skipped"] + window["trained"]
-                skip_rate = window["skipped"] / max(1, total_seen)
-                log_row = {
-                    "step": opt_step,
-                    "loss": round(avg_loss, 4),
-                    "skip_rate": round(skip_rate, 3),
-                    "lr": optimizer.param_groups[0]["lr"],
-                }
-                append_jsonl(log_path, log_row)
-                pbar.set_postfix(loss=f"{avg_loss:.4f}", skip=f"{skip_rate:.1%}")
-                window = {"skipped": 0, "trained": 0, "loss_sum": 0.0}
+                if opt_step % args.save_steps == 0:
+                    ckpt = args.output_dir / f"step_{opt_step}"
+                    student.save_pretrained(str(ckpt))
+                    tokenizer.save_pretrained(str(ckpt))
+                    torch.save({
+                        "opt_step": opt_step,
+                        "optimizer": optimizer.state_dict(),
+                        "scheduler": scheduler.state_dict(),
+                        "rng": torch.get_rng_state(),
+                    }, ckpt / "trainer_state.pt")
+                    print(f"\nSaved checkpoint: {ckpt}")
 
-            if opt_step % args.save_steps == 0:
-                ckpt = args.output_dir / f"step_{opt_step}"
-                student.save_pretrained(str(ckpt))
-                tokenizer.save_pretrained(str(ckpt))
-                torch.save({
-                    "opt_step": opt_step,
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "rng": torch.get_rng_state(),
-                }, ckpt / "trainer_state.pt")
-                print(f"\nSaved checkpoint: {ckpt}")
+                if opt_step >= args.max_steps:
+                    break
+
+        if not _diag_done:
+            total_tokens = sum(f.shape[0] - p for f, p in rollouts)
+            print(f"[diag] batch={args.gen_batch_size}  tokens={total_tokens}  gen={_gen_t:.1f}s  fwd+bwd={_fwd_bwd_t:.1f}s  gen_tok/s={total_tokens/_gen_t:.0f}")
+            _diag_done = True
 
     pbar.close()
     final_path = args.output_dir / "final"
