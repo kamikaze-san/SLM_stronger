@@ -546,6 +546,13 @@ def load_model_and_tokenizer(args: argparse.Namespace) -> tuple[Any, Any]:
     if model is None:
         raise RuntimeError(f"Could not load {args.model_name} with any supported AutoModel class.")
 
+    if getattr(args, "lora_adapter", None):
+        from peft import PeftModel
+        print(f"Loading LoRA adapter from {args.lora_adapter} ...")
+        model = PeftModel.from_pretrained(model, args.lora_adapter)
+        model = model.merge_and_unload()
+        print("LoRA merged in memory.")
+
     model.eval()
     return model, tokenizer
 
@@ -581,6 +588,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--strategyqa-max-new-tokens", type=int, default=MAX_NEW_TOKENS["strategyqa"])
     parser.add_argument("--limit", type=int, default=None, help="Optional smoke-test limit per benchmark.")
     parser.add_argument("--no-think", action="store_true", default=False, help="Disable thinking mode (Qwen3 and similar).")
+    parser.add_argument("--lora-adapter", default=None, help="Path to LoRA adapter dir; merged in memory, nothing written to disk.")
     return parser.parse_args()
 
 
