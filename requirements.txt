@@ -1,11 +1,17 @@
-flash_attn==2.7.4.post1
-torch==2.5.1
-transformers==4.49.0
-accelerate==1.3.0
+# Install torch first with CUDA 12.4 build:
+# pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+torch==2.6.0
+transformers==5.7.0
+accelerate
 datasets==3.3.2
-lm-eval==0.4.7
+peft
+verl==0.7.1
+numpy
 pandas==2.2.3
-numpy==1.26.4
 matplotlib==3.10.0
 seaborn==0.13.2
 tqdm==4.67.1
+
+# Optional: faster attention (must match torch+cuda version exactly)
+# pip install flash_attn
