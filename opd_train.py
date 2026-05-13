@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
-"""On-Policy Distillation (OPD) for Qwen3-1.7B.
+"""On-Policy Distillation (OPD) for Qwen3-1.7B with vLLM generation.
 
 Per-token reverse KL loss applied only on incorrect student rollouts.
-Teacher (Qwen3-14B) is frozen throughout.
+Teacher (Qwen3-14B) is frozen in PyTorch throughout.
+Student rollouts generated via vLLM (fast). Student weights synced to vLLM
+every --sync-steps optimizer steps.
 
-Loop per step:
-  1. Sample ZPD question
-  2. Student generates rollout (no grad)
-  3. Check correctness — skip if correct
-  4. Teacher forward pass on rollout (frozen, no grad)
-  5. Student forward pass with gradients
-  6. Reverse KL on generated tokens only
-  7. Accumulate gradients, optimizer step every --grad-accum rollouts
+Memory layout (~48GB):
+  Teacher  (PyTorch, frozen BF16): ~28GB
+  Student  (PyTorch, LoRA train):   ~4GB
+  Optimizer states:                 ~6GB
+  vLLM     (student generation):    ~8GB
+  Scratch:                          ~2GB
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import json
 import math
 import random
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -28,12 +29,19 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+from peft.utils import set_peft_model_state_dict
+from safetensors.torch import load_file
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
 
 
 SYSTEM_PROMPT = "Think through this step by step."
+SYNC_WEIGHTS_PATH = Path("/tmp/opd_sync_weights")
+LORA_TEMP_PATH = Path("/tmp/opd_lora_sync")
 
+
+# ── Data ───────────────────────────────────────────────────────────────────────
 
 def load_jsonl(path: Path) -> list[dict]:
     with path.open("r", encoding="utf-8") as f:
@@ -114,56 +122,7 @@ def check_correct(response: str, example: dict) -> bool:
     return False
 
 
-# ── Model loading ──────────────────────────────────────────────────────────────
-
-def get_eos_ids(tokenizer: Any) -> list[int]:
-    ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id else []
-    for token in ("<|end|>", "<|endoftext|>", "<|im_end|>"):
-        tid = tokenizer.convert_tokens_to_ids(token)
-        if tid is not None and tid != tokenizer.unk_token_id and tid not in ids:
-            ids.append(tid)
-    return ids
-
-
-def load_student(model_name: str, sft_adapter: Path | None, rank: int, alpha: int) -> Any:
-    base = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.bfloat16, trust_remote_code=True
-    )
-    if sft_adapter and sft_adapter.exists():
-        print(f"Merging SFT LoRA from {sft_adapter} into base (in memory)...")
-        base = PeftModel.from_pretrained(base, str(sft_adapter))
-        base = base.merge_and_unload()
-
-    config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=rank,
-        lora_alpha=alpha,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
-        bias="none",
-    )
-    model = get_peft_model(base, config)
-    model.cuda()
-    model.gradient_checkpointing_enable()
-    model.print_trainable_parameters()
-    return model
-
-
-def load_teacher(model_name: str) -> Any:
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-    return model
-
-
-# ── Prompt builder ─────────────────────────────────────────────────────────────
+# ── Prompt ─────────────────────────────────────────────────────────────────────
 
 def build_prompt(tokenizer: Any, question: str, no_think: bool) -> str:
     messages = [
@@ -179,31 +138,144 @@ def build_prompt(tokenizer: Any, question: str, no_think: bool) -> str:
     return tokenizer.apply_chat_template(messages, **kwargs)
 
 
-# ── Core OPD computation ───────────────────────────────────────────────────────
+def get_eos_ids(tokenizer: Any) -> list[int]:
+    ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id else []
+    for token in ("<|end|>", "<|endoftext|>", "<|im_end|>"):
+        tid = tokenizer.convert_tokens_to_ids(token)
+        if tid is not None and tid != tokenizer.unk_token_id and tid not in ids:
+            ids.append(tid)
+    return ids
 
-def generate_rollouts_batch(
-    model: Any,
-    tokenizer: Any,
-    prompts: list[str],
-    max_new_tokens: int,
-    eos_ids: list[int],
-) -> list[tuple[torch.Tensor, int]]:
-    """Generate a batch of rollouts. Returns list of (full_ids_cpu_1d, prompt_len)."""
-    device = next(model.parameters()).device
-    inputs = tokenizer(prompts, return_tensors="pt", padding=True).to(device)
-    prompt_len = inputs["input_ids"].shape[1]
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=0.7,
-            top_p=0.95,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=eos_ids,
+
+# ── Model loading ──────────────────────────────────────────────────────────────
+
+def load_student(args: argparse.Namespace, resume_ckpt: Path | None) -> Any:
+    base = AutoModelForCausalLM.from_pretrained(
+        args.student, torch_dtype=torch.bfloat16, trust_remote_code=True
+    )
+    if resume_ckpt is None and args.sft_adapter and args.sft_adapter.exists():
+        print(f"Merging SFT LoRA from {args.sft_adapter} ...")
+        base = PeftModel.from_pretrained(base, str(args.sft_adapter)).merge_and_unload()
+
+    config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=args.lora_rank,
+        lora_alpha=args.lora_alpha,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
+        bias="none",
+    )
+    model = get_peft_model(base, config)
+
+    if resume_ckpt is not None:
+        adapter_path = resume_ckpt / "adapter_model.safetensors"
+        if adapter_path.exists():
+            print(f"Loading OPD adapter from {resume_ckpt} ...")
+            set_peft_model_state_dict(model, load_file(str(adapter_path)))
+
+    model.cuda()
+    model.gradient_checkpointing_enable()
+    model.print_trainable_parameters()
+    return model
+
+
+def load_teacher(model_name: str) -> Any:
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True
+    )
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    return model
+
+
+def save_merged_for_vllm(student: Any, args: argparse.Namespace, dest: Path) -> bool:
+    """Merge current student LoRA into base and save to dest. Returns True on success."""
+    try:
+        student.save_pretrained(str(LORA_TEMP_PATH))
+
+        temp_base = AutoModelForCausalLM.from_pretrained(
+            args.student, torch_dtype=torch.bfloat16, trust_remote_code=True
         )
-    return [(outputs[i].cpu(), prompt_len) for i in range(len(prompts))]
+        temp_peft = PeftModel.from_pretrained(temp_base, str(LORA_TEMP_PATH))
+        merged = temp_peft.merge_and_unload()
 
+        tmp_dest = dest.parent / (dest.name + "_tmp")
+        merged.save_pretrained(str(tmp_dest))
+        del temp_base, temp_peft, merged
+        torch.cuda.empty_cache()
+
+        if dest.exists():
+            shutil.rmtree(str(dest))
+        shutil.move(str(tmp_dest), str(dest))
+        return True
+    except Exception as e:
+        print(f"[sync] save_merged_for_vllm failed: {e}")
+        torch.cuda.empty_cache()
+        return False
+
+
+def load_vllm(args: argparse.Namespace, weights_path: Path) -> LLM:
+    return LLM(
+        model=str(weights_path),
+        dtype="bfloat16",
+        gpu_memory_utilization=args.vllm_gpu_mem,
+        trust_remote_code=True,
+        enforce_eager=True,
+    )
+
+
+def sync_vllm(
+    student: Any,
+    vllm_model: LLM | None,
+    args: argparse.Namespace,
+    step: int,
+) -> LLM | None:
+    """Sync student weights into vLLM. Returns updated vllm_model (or old if OOM)."""
+    print(f"\n[sync] Step {step}: syncing student → vLLM ...")
+    t0 = time.perf_counter()
+
+    # Delete vLLM first to free memory before creating merged copy
+    if vllm_model is not None:
+        del vllm_model
+        torch.cuda.empty_cache()
+
+    saved = save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)
+    if not saved:
+        print(f"[sync] Merge failed, skipping reload.")
+        # Try to reload from last known good weights
+        if SYNC_WEIGHTS_PATH.exists():
+            try:
+                return load_vllm(args, SYNC_WEIGHTS_PATH)
+            except Exception:
+                torch.cuda.empty_cache()
+                return None
+        return None
+
+    try:
+        new_vllm = load_vllm(args, SYNC_WEIGHTS_PATH)
+        print(f"[sync] Done in {time.perf_counter()-t0:.1f}s")
+        return new_vllm
+    except torch.cuda.OutOfMemoryError:
+        print(f"[WARN] Step {step}: vLLM reload OOM. Trying lower gpu_memory_utilization ...")
+        torch.cuda.empty_cache()
+        try:
+            reduced = max(0.15, args.vllm_gpu_mem - 0.1)
+            return LLM(
+                model=str(SYNC_WEIGHTS_PATH),
+                dtype="bfloat16",
+                gpu_memory_utilization=reduced,
+                trust_remote_code=True,
+                enforce_eager=True,
+            )
+        except Exception as e:
+            print(f"[WARN] vLLM reload failed: {e}. Generation disabled until next sync.")
+            torch.cuda.empty_cache()
+            return None
+
+
+# ── KL loss ────────────────────────────────────────────────────────────────────
 
 def reverse_kl_loss(
     student: Any,
@@ -211,14 +283,12 @@ def reverse_kl_loss(
     full_ids: torch.Tensor,
     prompt_len: int,
 ) -> torch.Tensor:
-    """Reverse KL(student || teacher) averaged over generated tokens."""
+    """Reverse KL(student || teacher) averaged over generated tokens only."""
     student_device = next(student.parameters()).device
     teacher_device = next(teacher.parameters()).device
 
     input_ids = full_ids.unsqueeze(0)
     seq_len = full_ids.shape[0]
-
-    # logits[i] predicts token[i+1], generated tokens start at prompt_len
     gen_start = prompt_len - 1
     gen_end = seq_len - 1
 
@@ -232,8 +302,6 @@ def reverse_kl_loss(
 
     s_log_p = F.log_softmax(s_logits, dim=-1)
     t_log_p = F.log_softmax(t_logits, dim=-1)
-
-    # KL(student || teacher) = sum_x student(x) * [log student(x) - log teacher(x)]
     kl = (s_log_p.exp() * (s_log_p - t_log_p)).sum(-1).mean()
     return kl
 
@@ -243,24 +311,25 @@ def reverse_kl_loss(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--student", default="Qwen/Qwen3-1.7B")
-    parser.add_argument("--sft-adapter", type=Path, default=Path("checkpoints/sft_coldstart/final"),
-                        help="SFT LoRA adapter merged into student in memory before OPD.")
+    parser.add_argument("--sft-adapter", type=Path, default=Path("checkpoints/sft_coldstart/final"))
     parser.add_argument("--teacher", default="Qwen/Qwen3-14B")
     parser.add_argument("--train-data", type=Path, default=Path("data/zpd_filtered/all_zpd.jsonl"))
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/opd"))
-    parser.add_argument("--max-steps", type=int, default=2000,
-                        help="Number of optimizer steps (not total iterations).")
-    parser.add_argument("--grad-accum", type=int, default=8,
-                        help="Gradient accumulation over incorrect rollouts before optimizer step.")
+    parser.add_argument("--max-steps", type=int, default=2000)
+    parser.add_argument("--grad-accum", type=int, default=1)
     parser.add_argument("--lr", type=float, default=5e-6)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
-    parser.add_argument("--gen-batch-size", type=int, default=4,
-                        help="Rollouts to generate in one forward pass. Reduce if OOM during generation.")
+    parser.add_argument("--gen-batch-size", type=int, default=8,
+                        help="Rollouts per vLLM call. vLLM handles batching efficiently.")
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--save-steps", type=int, default=200)
+    parser.add_argument("--sync-steps", type=int, default=100,
+                        help="Sync student weights to vLLM every N optimizer steps.")
     parser.add_argument("--logging-steps", type=int, default=10)
     parser.add_argument("--warmup-steps", type=int, default=100)
+    parser.add_argument("--vllm-gpu-mem", type=float, default=0.3,
+                        help="gpu_memory_utilization for vLLM. Reduce if OOM.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-think", action="store_true", default=True)
     return parser.parse_args()
@@ -277,18 +346,47 @@ def main() -> None:
     questions = load_jsonl(args.train_data)
     print(f"Loaded {len(questions)} ZPD questions")
 
-    print(f"\nLoading student: {args.student}")
+    # Find latest OPD checkpoint for resuming
+    ckpt_dirs = sorted(args.output_dir.glob("step_*"),
+                       key=lambda p: int(p.name.split("_")[1]))
+    resume_ckpt = ckpt_dirs[-1] if ckpt_dirs else None
+    if resume_ckpt:
+        print(f"Found checkpoint: {resume_ckpt}")
+
+    print(f"\nLoading tokenizer: {args.student}")
     tokenizer = AutoTokenizer.from_pretrained(args.student, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
-
-    student = load_student(args.student, args.sft_adapter, args.lora_rank, args.lora_alpha)
     eos_ids = get_eos_ids(tokenizer)
+
+    print(f"Loading student: {args.student}")
+    student = load_student(args, resume_ckpt)
+
+    # Save initial merged weights for vLLM before loading teacher
+    # (teacher will consume ~28GB; doing this first keeps peak lower)
+    print("\nPreparing initial vLLM weights ...")
+    SYNC_WEIGHTS_PATH.mkdir(parents=True, exist_ok=True)
+    if not (SYNC_WEIGHTS_PATH / "config.json").exists():
+        save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)
+    # Also save tokenizer for vLLM
+    tokenizer.save_pretrained(str(SYNC_WEIGHTS_PATH))
 
     print(f"\nLoading teacher: {args.teacher}")
     teacher = load_teacher(args.teacher)
     print("Teacher frozen.")
+
+    print(f"\nLoading vLLM (gpu_memory_utilization={args.vllm_gpu_mem}) ...")
+    vllm_model = load_vllm(args, SYNC_WEIGHTS_PATH)
+    print("vLLM ready.")
+
+    sampling_params = SamplingParams(
+        temperature=0.7,
+        top_p=0.95,
+        max_tokens=args.max_new_tokens,
+        stop_token_ids=eos_ids,
+        skip_special_tokens=False,
+    )
 
     optimizer = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad],
@@ -304,75 +402,66 @@ def main() -> None:
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    log_path = args.output_dir / "opd_log.jsonl"
-    window = {"skipped": 0, "trained": 0, "loss_sum": 0.0}
-
-    optimizer.zero_grad()
-    accum_count = 0
     opt_step = 0
-
-    # Resume from latest checkpoint if available
-    ckpt_dirs = sorted(args.output_dir.glob("step_*"),
-                       key=lambda p: int(p.name.split("_")[1]))
-    if ckpt_dirs:
-        latest = ckpt_dirs[-1]
-        state_file = latest / "trainer_state.pt"
+    accum_count = 0
+    if resume_ckpt:
+        state_file = resume_ckpt / "trainer_state.pt"
         if state_file.exists():
-            print(f"Resuming from {latest} ...")
             state = torch.load(state_file, map_location="cpu")
             opt_step = state["opt_step"]
             optimizer.load_state_dict(state["optimizer"])
             scheduler.load_state_dict(state["scheduler"])
             torch.set_rng_state(state["rng"])
-            # Reload LoRA weights from checkpoint
-            from peft import set_peft_model_state_dict
-            from safetensors.torch import load_file
-            adapter_path = latest / "adapter_model.safetensors"
-            if adapter_path.exists():
-                adapter_weights = load_file(str(adapter_path))
-                set_peft_model_state_dict(student, adapter_weights)
             print(f"Resumed at step {opt_step}")
 
+    log_path = args.output_dir / "opd_log.jsonl"
+    window = {"skipped": 0, "trained": 0, "loss_sum": 0.0}
+    optimizer.zero_grad()
     pbar = tqdm(total=args.max_steps, initial=opt_step, desc="OPD")
 
-    _diag_done = False
     while opt_step < args.max_steps:
-        # Sample a batch of questions and generate all rollouts at once
+        # Sample batch of questions
         batch_qs = [random.choice(questions) for _ in range(args.gen_batch_size)]
         prompts = [build_prompt(tokenizer, q["question"], args.no_think) for q in batch_qs]
 
-        _t0 = time.perf_counter()
-        try:
-            rollouts = generate_rollouts_batch(
-                student, tokenizer, prompts, args.max_new_tokens, eos_ids
-            )
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            # Fallback: generate one at a time
-            rollouts = []
-            for prompt in prompts:
-                try:
-                    r = generate_rollouts_batch(student, tokenizer, [prompt], args.max_new_tokens, eos_ids)
-                    rollouts.extend(r)
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-        _gen_t = time.perf_counter() - _t0
-
-        _fwd_bwd_t = 0.0
-        for q, (full_ids, prompt_len) in zip(batch_qs, rollouts):
-            if full_ids.shape[0] <= prompt_len:
+        # Generate rollouts via vLLM (fast)
+        if vllm_model is None:
+            # vLLM unavailable (OOM during last sync), force a sync attempt
+            vllm_model = sync_vllm(student, None, args, opt_step)
+            if vllm_model is None:
                 continue
 
-            response = tokenizer.decode(full_ids[prompt_len:], skip_special_tokens=True)
+        t_gen = time.perf_counter()
+        outputs = vllm_model.generate(prompts, sampling_params)
+        gen_time = time.perf_counter() - t_gen
+        total_gen_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+
+        # Process each rollout
+        for q, output in zip(batch_qs, outputs):
+            prompt_ids = list(output.prompt_token_ids)
+            gen_ids = list(output.outputs[0].token_ids)
+
+            if not gen_ids:
+                continue
+
+            response = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
             if check_correct(response, q):
                 window["skipped"] += 1
                 continue
 
-            _t0 = time.perf_counter()
-            loss = reverse_kl_loss(student, teacher, full_ids, prompt_len)
-            (loss / args.grad_accum).backward()
-            _fwd_bwd_t += time.perf_counter() - _t0
+            full_ids = torch.tensor(prompt_ids + gen_ids)
+            prompt_len = len(prompt_ids)
+
+            try:
+                loss = reverse_kl_loss(student, teacher, full_ids, prompt_len)
+                (loss / args.grad_accum).backward()
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                optimizer.zero_grad()
+                accum_count = 0
+                print("[OOM] KL step skipped, cache cleared.")
+                continue
 
             accum_count += 1
             window["trained"] += 1
@@ -393,14 +482,17 @@ def main() -> None:
                     avg_loss = window["loss_sum"] / max(1, window["trained"])
                     total_seen = window["skipped"] + window["trained"]
                     skip_rate = window["skipped"] / max(1, total_seen)
+                    tok_per_sec = total_gen_tokens / max(gen_time, 1e-6)
                     log_row = {
                         "step": opt_step,
                         "loss": round(avg_loss, 4),
                         "skip_rate": round(skip_rate, 3),
                         "lr": optimizer.param_groups[0]["lr"],
+                        "gen_tok_per_sec": round(tok_per_sec, 1),
                     }
                     append_jsonl(log_path, log_row)
-                    pbar.set_postfix(loss=f"{avg_loss:.4f}", skip=f"{skip_rate:.1%}")
+                    pbar.set_postfix(loss=f"{avg_loss:.4f}", skip=f"{skip_rate:.1%}",
+                                     tok_s=f"{tok_per_sec:.0f}")
                     window = {"skipped": 0, "trained": 0, "loss_sum": 0.0}
 
                 if opt_step % args.save_steps == 0:
@@ -415,13 +507,11 @@ def main() -> None:
                     }, ckpt / "trainer_state.pt")
                     print(f"\nSaved checkpoint: {ckpt}")
 
+                if opt_step % args.sync_steps == 0:
+                    vllm_model = sync_vllm(student, vllm_model, args, opt_step)
+
                 if opt_step >= args.max_steps:
                     break
-
-        if not _diag_done:
-            total_tokens = sum(f.shape[0] - p for f, p in rollouts)
-            print(f"[diag] batch={args.gen_batch_size}  tokens={total_tokens}  gen={_gen_t:.1f}s  fwd+bwd={_fwd_bwd_t:.1f}s  gen_tok/s={total_tokens/_gen_t:.0f}")
-            _diag_done = True
 
     pbar.close()
     final_path = args.output_dir / "final"
