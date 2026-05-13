@@ -111,23 +111,31 @@ def build_prompt(tokenizer: Any, question: str, no_think: bool) -> str:
     return f"System: {SYSTEM_PROMPT}\n\nUser: {question}\n\nAssistant:"
 
 
-def generate_completions(
+def get_eos_ids(tokenizer: Any) -> list[int]:
+    ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id else []
+    for token in ("<|end|>", "<|endoftext|>", "<|im_end|>"):
+        tid = tokenizer.convert_tokens_to_ids(token)
+        if tid is not None and tid != tokenizer.unk_token_id and tid not in ids:
+            ids.append(tid)
+    return ids
+
+
+def generate_completions_batch(
     model: Any,
     tokenizer: Any,
-    prompt: str,
+    prompts: list[str],
     n: int,
     max_new_tokens: int,
     temperature: float,
-) -> list[str]:
+) -> list[list[str]]:
+    """Generate n completions for each prompt. Returns list[list[str]] shape (len(prompts), n)."""
     device = next(model.parameters()).device
-    inputs = tokenizer([prompt], return_tensors="pt").to(device)
-    input_len = inputs["input_ids"].shape[1]
+    eos_ids = get_eos_ids(tokenizer)
 
-    eos_ids = [tokenizer.eos_token_id] if tokenizer.eos_token_id else []
-    for token in ("<|end|>", "<|endoftext|>", "<|im_end|>"):
-        tid = tokenizer.convert_tokens_to_ids(token)
-        if tid is not None and tid != tokenizer.unk_token_id and tid not in eos_ids:
-            eos_ids.append(tid)
+    # Repeat each prompt n times so we can generate all completions in one forward pass
+    repeated = [p for p in prompts for _ in range(n)]
+    inputs = tokenizer(repeated, return_tensors="pt", padding=True).to(device)
+    input_len = inputs["input_ids"].shape[1]
 
     with torch.inference_mode():
         outputs = model.generate(
@@ -136,17 +144,18 @@ def generate_completions(
             do_sample=True,
             temperature=temperature,
             top_p=0.95,
-            num_return_sequences=n,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=eos_ids,
         )
 
-    responses = []
+    all_responses = []
     for output in outputs:
         generated = output[input_len:]
         raw = tokenizer.decode(generated, skip_special_tokens=False)
-        responses.append(truncate_at_stop_token(raw))
-    return responses
+        all_responses.append(truncate_at_stop_token(raw))
+
+    # Reshape (len(prompts) * n,) → (len(prompts), n)
+    return [all_responses[i * n: (i + 1) * n] for i in range(len(prompts))]
 
 
 def self_consistency_filter(
@@ -219,6 +228,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-new-tokens", type=int, default=2048)
     parser.add_argument("--no-think", action="store_true", default=False,
                         help="Disable thinking mode (for Qwen3 teacher).")
+    parser.add_argument("--batch-size", type=int, default=2,
+                        help="Questions per batch. Each question generates n_completions sequences, "
+                             "so actual GPU batch = batch_size * n_completions.")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -248,47 +260,63 @@ def main() -> None:
     model, tokenizer = load_model_and_tokenizer(args.teacher, args.no_think)
     print("Teacher loaded and frozen.")
 
-    stats = {"passed": 0, "failed_consistency": 0, "no_answer": 0}
-    progress = tqdm(pending, desc="teacher traces")
+    stats = {"passed": 0, "failed_consistency": 0}
+    progress = tqdm(total=len(pending), desc="teacher traces")
 
-    for q in progress:
-        prompt = build_prompt(tokenizer, q["question"], args.no_think)
-        responses = generate_completions(
-            model, tokenizer, prompt,
-            n=args.n_completions,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-        )
-        majority_ans, shortest_trace = self_consistency_filter(
-            responses, q["benchmark"], args.threshold
-        )
+    for start in range(0, len(pending), args.batch_size):
+        batch = pending[start: start + args.batch_size]
+        prompts = [build_prompt(tokenizer, q["question"], args.no_think) for q in batch]
 
-        if majority_ans is None:
-            stats["failed_consistency"] += 1
-            continue
+        try:
+            batch_responses = generate_completions_batch(
+                model, tokenizer, prompts,
+                n=args.n_completions,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+            )
+        except torch.cuda.OutOfMemoryError:
+            # Fallback: process one at a time if batch OOMs
+            torch.cuda.empty_cache()
+            batch_responses = []
+            for prompt in prompts:
+                single = generate_completions_batch(
+                    model, tokenizer, [prompt],
+                    n=args.n_completions,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                )
+                batch_responses.extend(single)
 
-        formatted = format_output(shortest_trace, majority_ans)
-        row = {
-            "question_id": q["question_id"],
-            "benchmark": q["benchmark"],
-            "subject": q.get("subject", ""),
-            "question": q["question"],
-            "ground_truth": q["ground_truth"],
-            "teacher_answer": majority_ans,
-            "output": formatted,
-            "n_completions": args.n_completions,
-            "n_agreed": sum(
-                1 for r in responses
-                if extract_final_answer(r, q["benchmark"]) == majority_ans
-            ),
-        }
-        append_jsonl(args.output, row)
-        stats["passed"] += 1
+        for q, responses in zip(batch, batch_responses):
+            majority_ans, shortest_trace = self_consistency_filter(
+                responses, q["benchmark"], args.threshold
+            )
 
-        progress.set_postfix(
-            passed=stats["passed"],
-            failed=stats["failed_consistency"],
-        )
+            if majority_ans is None:
+                stats["failed_consistency"] += 1
+                progress.update(1)
+                continue
+
+            formatted = format_output(shortest_trace, majority_ans)
+            row = {
+                "question_id": q["question_id"],
+                "benchmark": q["benchmark"],
+                "subject": q.get("subject", ""),
+                "question": q["question"],
+                "ground_truth": q["ground_truth"],
+                "teacher_answer": majority_ans,
+                "output": formatted,
+                "n_completions": args.n_completions,
+                "n_agreed": sum(
+                    1 for r in responses
+                    if extract_final_answer(r, q["benchmark"]) == majority_ans
+                ),
+            }
+            append_jsonl(args.output, row)
+            stats["passed"] += 1
+            progress.update(1)
+
+        progress.set_postfix(passed=stats["passed"], failed=stats["failed_consistency"])
 
     total = len(pending)
     print(f"\n=== TEACHER TRACE GENERATION COMPLETE ===")
