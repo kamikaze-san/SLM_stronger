@@ -94,9 +94,10 @@ def load_model_and_tokenizer(model_name: str) -> tuple[Any, Any]:
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
         trust_remote_code=True,
     )
+    model = model.cuda()
+    model.gradient_checkpointing_enable()
     return model, tokenizer
 
 
@@ -195,6 +196,7 @@ def main() -> None:
         load_best_model_at_end=True,
         metric_for_best_model="eval_loss",
         greater_is_better=False,
+        gradient_checkpointing=True,
         report_to="none",
         seed=args.seed,
         dataloader_num_workers=2,
