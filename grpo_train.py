@@ -254,7 +254,7 @@ def load_student(args: argparse.Namespace, resume_ckpt: Path | None) -> Any:
     return model
 
 
-def save_merged_for_vllm(student: Any, args: argparse.Namespace, dest: Path) -> bool:
+def save_merged_for_vllm(student: Any, tokenizer: Any, args: argparse.Namespace, dest: Path) -> bool:
     """Write base(+SFT)+current adapter to dest, for vLLM to generate from.
 
     Raises on failure. It previously swallowed the exception and returned False,
@@ -292,11 +292,16 @@ def save_merged_for_vllm(student: Any, args: argparse.Namespace, dest: Path) -> 
     if tmp_dest.exists():
         shutil.rmtree(str(tmp_dest))
     merged.save_pretrained(str(tmp_dest))
+    # The tokenizer must go into tmp_dest, not dest: the move below replaces
+    # dest wholesale, so anything written there separately is destroyed.
+    tokenizer.save_pretrained(str(tmp_dest))
     del temp_base, temp_peft, merged
     torch.cuda.empty_cache()
 
     if not (tmp_dest / "config.json").exists():
         raise RuntimeError(f"[sync] merged save produced no config.json in {tmp_dest}")
+    if not (tmp_dest / "tokenizer.json").exists():
+        raise RuntimeError(f"[sync] merged save produced no tokenizer.json in {tmp_dest}")
 
     if dest.exists():
         shutil.rmtree(str(dest))
@@ -317,6 +322,7 @@ def load_vllm(args: argparse.Namespace, weights_path: Path) -> LLM:
 
 def sync_vllm(
     student: Any,
+    tokenizer: Any,
     vllm_model: LLM | None,
     args: argparse.Namespace,
     step: int,
@@ -328,7 +334,7 @@ def sync_vllm(
         del vllm_model
         torch.cuda.empty_cache()
 
-    save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)   # raises on failure
+    save_merged_for_vllm(student, tokenizer, args, SYNC_WEIGHTS_PATH)   # raises on failure
 
     try:
         new_vllm = load_vllm(args, SYNC_WEIGHTS_PATH)
@@ -472,8 +478,7 @@ def main() -> None:
     # restarted run silently adopted the previous run's snapshot.
     print("\nPreparing initial vLLM weights ...")
     SYNC_WEIGHTS_PATH.mkdir(parents=True, exist_ok=True)
-    save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)
-    tokenizer.save_pretrained(str(SYNC_WEIGHTS_PATH))
+    save_merged_for_vllm(student, tokenizer, args, SYNC_WEIGHTS_PATH)
 
     print(f"\nLoading vLLM (gpu_memory_utilization={args.vllm_gpu_mem}) ...")
     vllm_model = load_vllm(args, SYNC_WEIGHTS_PATH)
@@ -527,7 +532,7 @@ def main() -> None:
             prompts.extend([build_prompt(tokenizer, q, args.no_think)] * args.num_rollouts)
 
         if vllm_model is None:
-            vllm_model = sync_vllm(student, None, args, opt_step)
+            vllm_model = sync_vllm(student, tokenizer, None, args, opt_step)
             if vllm_model is None:
                 continue
 
@@ -620,7 +625,7 @@ def main() -> None:
             print(f"\nSaved checkpoint: {ckpt}")
 
         if opt_step % args.sync_steps == 0:
-            vllm_model = sync_vllm(student, vllm_model, args, opt_step)
+            vllm_model = sync_vllm(student, tokenizer, vllm_model, args, opt_step)
 
     pbar.close()
     final_path = args.output_dir / "final"
