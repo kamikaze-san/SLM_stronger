@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""Rejection Sampling Fine-Tuning (RFT) for Qwen3-1.7B.
+"""GRPO (Group Relative Policy Optimization) for Qwen3-1.7B.
 
-NLL loss applied only on CORRECT student rollouts (reinforce what works).
-No teacher needed — frees ~28GB VRAM vs OPD.
-Student rollouts generated via vLLM (fast). Weights synced every --sync-steps.
+For each question, sample K rollouts. Reward = 1 if the final answer is
+correct, else 0. Advantage = group-normalised reward, so correct rollouts get
+positive gradient and incorrect ones get negative gradient, relative to how
+hard that particular question is for the current policy.
+
+Contrast with the other two runs in this repo:
+  opd_train.py  reverse KL, incorrect rollouts only  -> negative signal only
+  rft_train.py  NLL,        correct   rollouts only  -> positive signal only
+  grpo_train.py policy grad, all rollouts, K per q   -> both, relative
+
+No teacher needed. Student rollouts generated via vLLM, weights synced every
+--sync-steps optimizer steps.
 
 Memory layout (~20GB):
   Student  (PyTorch, LoRA train):   ~4GB
   Optimizer states:                 ~6GB
-  vLLM     (student generation):   ~8GB
+  vLLM     (student generation):    ~8GB
   Scratch:                          ~2GB
 """
 
@@ -35,8 +44,8 @@ from vllm import LLM, SamplingParams
 
 
 SYSTEM_PROMPT = "Think through this step by step."
-SYNC_WEIGHTS_PATH = Path("/tmp/rft_sync_weights")
-LORA_TEMP_PATH = Path("/tmp/rft_lora_sync")
+SYNC_WEIGHTS_PATH = Path("/tmp/grpo_sync_weights")
+LORA_TEMP_PATH = Path("/tmp/grpo_lora_sync")
 
 
 # ── Data ───────────────────────────────────────────────────────────────────────
@@ -169,7 +178,7 @@ def load_student(args: argparse.Namespace, resume_ckpt: Path | None) -> Any:
     if resume_ckpt is not None:
         adapter_path = resume_ckpt / "adapter_model.safetensors"
         if adapter_path.exists():
-            print(f"Loading RFT adapter from {resume_ckpt} ...")
+            print(f"Loading GRPO adapter from {resume_ckpt} ...")
             set_peft_model_state_dict(model, load_file(str(adapter_path)))
 
     model.cuda()
@@ -229,7 +238,7 @@ def sync_vllm(
 
     saved = save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)
     if not saved:
-        print(f"[sync] Merge failed, skipping reload.")
+        print("[sync] Merge failed, skipping reload.")
         if SYNC_WEIGHTS_PATH.exists():
             try:
                 return load_vllm(args, SYNC_WEIGHTS_PATH)
@@ -261,23 +270,47 @@ def sync_vllm(
             return None
 
 
-# ── NLL loss (reinforce correct rollout) ───────────────────────────────────────
+# ── GRPO loss ──────────────────────────────────────────────────────────────────
 
-def nll_loss(
+def group_advantages(rewards: list[float]) -> list[float] | None:
+    """Group-normalised advantages. None if the group carries no signal."""
+    n = len(rewards)
+    mean = sum(rewards) / n
+    var = sum((r - mean) ** 2 for r in rewards) / n
+    std = math.sqrt(var)
+    if std < 1e-6:          # all correct or all wrong -> nothing to learn from
+        return None
+    return [(r - mean) / (std + 1e-4) for r in rewards]
+
+
+def policy_gradient_loss(
     student: Any,
     full_ids: torch.Tensor,
     prompt_len: int,
+    advantage: float,
 ) -> torch.Tensor:
-    """Standard causal LM NLL loss over generated tokens only."""
+    """-A * mean log pi(generated tokens).
+
+    One optimizer step per generation batch means the policy is unchanged while
+    the batch is consumed, so the PPO importance ratio is exactly 1 and the
+    clipped surrogate reduces to this. Length-normalised so long rollouts do not
+    dominate.
+    """
     device = next(student.parameters()).device
     input_ids = full_ids.unsqueeze(0).to(device)
 
-    logits = student(input_ids).logits[0]          # [seq_len, vocab]
-    shift_logits = logits[:-1]                      # predict next token
-    shift_labels = full_ids[1:].to(device)
-    shift_labels[:prompt_len - 1] = -100            # mask prompt tokens
+    seq_len = full_ids.shape[0]
+    gen_start = prompt_len - 1
+    gen_end = seq_len - 1
+    if gen_start >= gen_end:
+        return torch.zeros((), device=device, requires_grad=True)
 
-    return F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+    logits = student(input_ids).logits[0, gen_start:gen_end]
+    targets = full_ids[prompt_len:].to(device)
+
+    log_probs = F.log_softmax(logits, dim=-1)
+    token_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    return -advantage * token_logp.mean()
 
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -287,19 +320,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--student", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--sft-adapter", type=Path, default=Path("checkpoints/sft_coldstart/final"))
     parser.add_argument("--train-data", type=Path, default=Path("data/zpd_filtered/all_zpd.jsonl"))
-    parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/rft"))
-    parser.add_argument("--max-steps", type=int, default=2000)
-    parser.add_argument("--grad-accum", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=5e-6)
+    parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/grpo"))
+    parser.add_argument("--max-steps", type=int, default=500,
+                        help="Optimizer steps. Each consumes questions-per-step * num-rollouts rollouts.")
+    parser.add_argument("--questions-per-step", type=int, default=8)
+    parser.add_argument("--num-rollouts", type=int, default=8,
+                        help="K rollouts per question. Must be >1 for group advantages to exist.")
+    parser.add_argument("--lr", type=float, default=2e-6)
     parser.add_argument("--max-new-tokens", type=int, default=1024)
-    parser.add_argument("--gen-batch-size", type=int, default=8)
     parser.add_argument("--lora-rank", type=int, default=32)
     parser.add_argument("--lora-alpha", type=int, default=64)
-    parser.add_argument("--save-steps", type=int, default=200)
-    parser.add_argument("--sync-steps", type=int, default=100)
-    parser.add_argument("--logging-steps", type=int, default=10)
-    parser.add_argument("--warmup-steps", type=int, default=100)
-    parser.add_argument("--vllm-gpu-mem", type=float, default=0.3)
+    parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument("--sync-steps", type=int, default=20,
+                        help="Lower = closer to on-policy, but each sync reloads vLLM (~30-60s).")
+    parser.add_argument("--logging-steps", type=int, default=5)
+    parser.add_argument("--warmup-steps", type=int, default=25)
+    parser.add_argument("--vllm-gpu-mem", type=float, default=0.45)
+    parser.add_argument("--temperature", type=float, default=1.0,
+                        help="Higher than eval on purpose: exploration is what surfaces rare successes.")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no-think", action="store_true", default=True)
     return parser.parse_args()
@@ -315,6 +353,8 @@ def main() -> None:
 
     questions = load_jsonl(args.train_data)
     print(f"Loaded {len(questions)} ZPD questions")
+    print(f"Each step: {args.questions_per_step} questions x {args.num_rollouts} rollouts "
+          f"= {args.questions_per_step * args.num_rollouts} generations")
 
     ckpt_dirs = sorted(args.output_dir.glob("step_*"),
                        key=lambda p: int(p.name.split("_")[1]))
@@ -340,10 +380,11 @@ def main() -> None:
 
     print(f"\nLoading vLLM (gpu_memory_utilization={args.vllm_gpu_mem}) ...")
     vllm_model = load_vllm(args, SYNC_WEIGHTS_PATH)
-    print("vLLM ready. No teacher loaded — ~28GB freed.")
+    print("vLLM ready. No teacher loaded.")
 
     sampling_params = SamplingParams(
-        temperature=0.7,
+        n=args.num_rollouts,
+        temperature=args.temperature,
         top_p=0.95,
         max_tokens=args.max_new_tokens,
         stop_token_ids=eos_ids,
@@ -365,7 +406,6 @@ def main() -> None:
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     opt_step = 0
-    accum_count = 0
     if resume_ckpt:
         state_file = resume_ckpt / "trainer_state.pt"
         if state_file.exists():
@@ -376,13 +416,13 @@ def main() -> None:
             torch.set_rng_state(state["rng"])
             print(f"Resumed at step {opt_step}")
 
-    log_path = args.output_dir / "rft_log.jsonl"
-    window = {"skipped": 0, "trained": 0, "loss_sum": 0.0}
-    optimizer.zero_grad()
-    pbar = tqdm(total=args.max_steps, initial=opt_step, desc="RFT")
+    log_path = args.output_dir / "grpo_log.jsonl"
+    window = {"reward_sum": 0.0, "n_rollouts": 0, "groups": 0,
+              "dead_groups": 0, "loss_sum": 0.0, "n_backward": 0}
+    pbar = tqdm(total=args.max_steps, initial=opt_step, desc="GRPO")
 
     while opt_step < args.max_steps:
-        batch_qs = [random.choice(questions) for _ in range(args.gen_batch_size)]
+        batch_qs = [random.choice(questions) for _ in range(args.questions_per_step)]
         prompts = [build_prompt(tokenizer, q["question"], args.no_think) for q in batch_qs]
 
         if vllm_model is None:
@@ -393,89 +433,98 @@ def main() -> None:
         t_gen = time.perf_counter()
         outputs = vllm_model.generate(prompts, sampling_params)
         gen_time = time.perf_counter() - t_gen
-        total_gen_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+        total_gen_tokens = sum(len(c.token_ids) for o in outputs for c in o.outputs)
+
+        optimizer.zero_grad()
+        n_backward = 0
 
         for q, output in zip(batch_qs, outputs):
             prompt_ids = list(output.prompt_token_ids)
-            gen_ids = list(output.outputs[0].token_ids)
-
-            if not gen_ids:
+            completions = [c for c in output.outputs if len(c.token_ids) > 0]
+            if len(completions) < 2:
                 continue
 
-            response = tokenizer.decode(gen_ids, skip_special_tokens=True)
+            rewards = [
+                1.0 if check_correct(tokenizer.decode(c.token_ids, skip_special_tokens=True), q) else 0.0
+                for c in completions
+            ]
+            window["reward_sum"] += sum(rewards)
+            window["n_rollouts"] += len(rewards)
+            window["groups"] += 1
 
-            if not check_correct(response, q):
-                window["skipped"] += 1
+            advantages = group_advantages(rewards)
+            if advantages is None:
+                window["dead_groups"] += 1
                 continue
 
-            full_ids = torch.tensor(prompt_ids + gen_ids)
-            prompt_len = len(prompt_ids)
+            # Normalise so a step's gradient magnitude does not depend on how
+            # many groups happened to carry signal.
+            denom = args.questions_per_step * len(completions)
 
-            try:
-                loss = nll_loss(student, full_ids, prompt_len)
-                (loss / args.grad_accum).backward()
-            except torch.cuda.OutOfMemoryError:
-                torch.cuda.empty_cache()
-                optimizer.zero_grad()
-                accum_count = 0
-                print("[OOM] NLL step skipped, cache cleared.")
-                continue
+            for c, adv in zip(completions, advantages):
+                full_ids = torch.tensor(prompt_ids + list(c.token_ids))
+                try:
+                    loss = policy_gradient_loss(student, full_ids, len(prompt_ids), adv)
+                    (loss / denom).backward()
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    print("[OOM] rollout skipped, cache cleared.")
+                    continue
+                window["loss_sum"] += loss.item()
+                n_backward += 1
 
-            accum_count += 1
-            window["trained"] += 1
-            window["loss_sum"] += loss.item()
+        if n_backward == 0:
+            # Every group was all-correct or all-wrong; nothing to update on.
+            continue
 
-            if accum_count >= args.grad_accum:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in student.parameters() if p.requires_grad], 1.0
-                )
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
-                accum_count = 0
-                opt_step += 1
-                pbar.update(1)
+        window["n_backward"] += n_backward
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in student.parameters() if p.requires_grad], 1.0
+        )
+        optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
+        opt_step += 1
+        pbar.update(1)
 
-                if opt_step % args.logging_steps == 0:
-                    avg_loss = window["loss_sum"] / max(1, window["trained"])
-                    total_seen = window["skipped"] + window["trained"]
-                    skip_rate = window["skipped"] / max(1, total_seen)
-                    tok_per_sec = total_gen_tokens / max(gen_time, 1e-6)
-                    log_row = {
-                        "step": opt_step,
-                        "loss": round(avg_loss, 4),
-                        "skip_rate": round(skip_rate, 3),
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "gen_tok_per_sec": round(tok_per_sec, 1),
-                    }
-                    append_jsonl(log_path, log_row)
-                    pbar.set_postfix(loss=f"{avg_loss:.4f}", skip=f"{skip_rate:.1%}",
-                                     tok_s=f"{tok_per_sec:.0f}")
-                    window = {"skipped": 0, "trained": 0, "loss_sum": 0.0}
+        if opt_step % args.logging_steps == 0:
+            mean_reward = window["reward_sum"] / max(1, window["n_rollouts"])
+            dead_rate = window["dead_groups"] / max(1, window["groups"])
+            log_row = {
+                "step": opt_step,
+                "mean_reward": round(mean_reward, 4),
+                "dead_group_rate": round(dead_rate, 3),
+                "loss": round(window["loss_sum"] / max(1, window["n_backward"]), 4),
+                "lr": optimizer.param_groups[0]["lr"],
+                "gen_tok_per_sec": round(total_gen_tokens / max(gen_time, 1e-6), 1),
+            }
+            append_jsonl(log_path, log_row)
+            pbar.set_postfix(reward=f"{mean_reward:.3f}", dead=f"{dead_rate:.1%}")
+            window = {"reward_sum": 0.0, "n_rollouts": 0, "groups": 0,
+                      "dead_groups": 0, "loss_sum": 0.0, "n_backward": 0}
 
-                if opt_step % args.save_steps == 0:
-                    ckpt = args.output_dir / f"step_{opt_step}"
-                    student.save_pretrained(str(ckpt))
-                    tokenizer.save_pretrained(str(ckpt))
-                    torch.save({
-                        "opt_step": opt_step,
-                        "optimizer": optimizer.state_dict(),
-                        "scheduler": scheduler.state_dict(),
-                        "rng": torch.get_rng_state(),
-                    }, ckpt / "trainer_state.pt")
-                    print(f"\nSaved checkpoint: {ckpt}")
+        if opt_step % args.save_steps == 0:
+            ckpt = args.output_dir / f"step_{opt_step}"
+            student.save_pretrained(str(ckpt))
+            tokenizer.save_pretrained(str(ckpt))
+            torch.save({
+                "opt_step": opt_step,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "rng": torch.get_rng_state(),
+            }, ckpt / "trainer_state.pt")
+            print(f"\nSaved checkpoint: {ckpt}")
 
-                if opt_step % args.sync_steps == 0:
-                    vllm_model = sync_vllm(student, vllm_model, args, opt_step)
-
-                if opt_step >= args.max_steps:
-                    break
+        if opt_step % args.sync_steps == 0:
+            vllm_model = sync_vllm(student, vllm_model, args, opt_step)
 
     pbar.close()
     final_path = args.output_dir / "final"
     student.save_pretrained(str(final_path))
     tokenizer.save_pretrained(str(final_path))
-    print(f"\nRFT complete. Final adapter saved to {final_path}")
+    print(f"\nGRPO complete. Final adapter saved to {final_path}")
+    print(f"Copy the merged snapshot out of /tmp now:\n"
+          f"  cp -r {SYNC_WEIGHTS_PATH} checkpoints/grpo_merged")
 
 
 if __name__ == "__main__":
