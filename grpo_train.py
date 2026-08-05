@@ -382,8 +382,10 @@ def main() -> None:
     vllm_model = load_vllm(args, SYNC_WEIGHTS_PATH)
     print("vLLM ready. No teacher loaded.")
 
+    # n=1 with duplicated prompts rather than n=K: vLLM V0's multi-sample
+    # sampler hits an illegal memory access on this setup.
     sampling_params = SamplingParams(
-        n=args.num_rollouts,
+        n=1,
         temperature=args.temperature,
         top_p=0.95,
         max_tokens=args.max_new_tokens,
@@ -423,7 +425,9 @@ def main() -> None:
 
     while opt_step < args.max_steps:
         batch_qs = [random.choice(questions) for _ in range(args.questions_per_step)]
-        prompts = [build_prompt(tokenizer, q["question"], args.no_think) for q in batch_qs]
+        prompts: list[str] = []
+        for q in batch_qs:
+            prompts.extend([build_prompt(tokenizer, q["question"], args.no_think)] * args.num_rollouts)
 
         if vllm_model is None:
             vllm_model = sync_vllm(student, None, args, opt_step)
@@ -433,14 +437,17 @@ def main() -> None:
         t_gen = time.perf_counter()
         outputs = vllm_model.generate(prompts, sampling_params)
         gen_time = time.perf_counter() - t_gen
-        total_gen_tokens = sum(len(c.token_ids) for o in outputs for c in o.outputs)
+        total_gen_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
 
         optimizer.zero_grad()
         n_backward = 0
 
-        for q, output in zip(batch_qs, outputs):
-            prompt_ids = list(output.prompt_token_ids)
-            completions = [c for c in output.outputs if len(c.token_ids) > 0]
+        for gi, q in enumerate(batch_qs):
+            group = outputs[gi * args.num_rollouts : (gi + 1) * args.num_rollouts]
+            if not group:
+                continue
+            prompt_ids = list(group[0].prompt_token_ids)
+            completions = [o.outputs[0] for o in group if len(o.outputs[0].token_ids) > 0]
             if len(completions) < 2:
                 continue
 
