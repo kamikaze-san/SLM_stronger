@@ -35,8 +35,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from peft import LoraConfig, PeftModel, TaskType, get_peft_model
-from peft.utils import set_peft_model_state_dict
+from peft import LoraConfig, TaskType, get_peft_model
 from safetensors.torch import load_file
 from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -188,13 +187,43 @@ def use_sft(args: argparse.Namespace) -> bool:
     return (not args.no_sft) and args.sft_adapter is not None and args.sft_adapter.exists()
 
 
+def load_adapter_into(peft_model: Any, adapter_dir: Path) -> int:
+    """Load a saved LoRA adapter using plain torch load_state_dict.
+
+    peft's own loader (set_peft_model_state_dict / PeftModel.from_pretrained)
+    imports ALL_PARALLEL_STYLES from transformers.integrations.tensor_parallel,
+    which does not exist in transformers 4.51 — that ImportError is what froze
+    the generation policy in earlier runs. Saved adapters omit the adapter name
+    from their keys ("...lora_A.weight" vs "...lora_A.default.weight"), so the
+    only real work here is re-inserting it. Every key must map, or we raise.
+    """
+    sd = load_file(str(adapter_dir / "adapter_model.safetensors"))
+    target = set(peft_model.state_dict().keys())
+    remapped: dict[str, Any] = {}
+    for k, v in sd.items():
+        if k in target:
+            remapped[k] = v
+            continue
+        alt = (k.replace(".lora_A.weight", ".lora_A.default.weight")
+                .replace(".lora_B.weight", ".lora_B.default.weight"))
+        if alt not in target:
+            raise RuntimeError(f"[adapter] cannot map key from {adapter_dir}: {k}")
+        remapped[alt] = v
+    peft_model.load_state_dict(remapped, strict=False)
+    return len(remapped)
+
+
 def load_base_backbone(args: argparse.Namespace) -> Any:
     """Base model with SFT folded in (if used). The backbone all adapters sit on."""
     model = AutoModelForCausalLM.from_pretrained(
         args.student, torch_dtype=torch.bfloat16, trust_remote_code=True
     )
     if use_sft(args):
-        model = PeftModel.from_pretrained(model, str(args.sft_adapter)).merge_and_unload()
+        sft_cfg = LoraConfig.from_pretrained(str(args.sft_adapter))
+        wrapped = get_peft_model(model, sft_cfg)
+        n = load_adapter_into(wrapped, args.sft_adapter)
+        print(f"Merged SFT LoRA from {args.sft_adapter} ({n} tensors)")
+        model = wrapped.merge_and_unload()
     return model
 
 
@@ -215,10 +244,9 @@ def load_student(args: argparse.Namespace, resume_ckpt: Path | None) -> Any:
     model = get_peft_model(base, config)
 
     if resume_ckpt is not None:
-        adapter_path = resume_ckpt / "adapter_model.safetensors"
-        if adapter_path.exists():
-            print(f"Loading GRPO adapter from {resume_ckpt} ...")
-            set_peft_model_state_dict(model, load_file(str(adapter_path)))
+        if (resume_ckpt / "adapter_model.safetensors").exists():
+            n = load_adapter_into(model, resume_ckpt)
+            print(f"Loaded GRPO adapter from {resume_ckpt} ({n} tensors)")
 
     model.cuda()
     model.gradient_checkpointing_enable()
@@ -240,12 +268,24 @@ def save_merged_for_vllm(student: Any, args: argparse.Namespace, dest: Path) -> 
             "silently freezes the generation policy."
         )
 
-    student.save_pretrained(str(LORA_TEMP_PATH))
+    # Copy LoRA weights straight out of the live student. We deliberately do NOT
+    # round-trip through save_pretrained + PeftModel.from_pretrained: that path
+    # calls peft's set_peft_model_state_dict, which in peft 0.19 imports
+    # ALL_PARALLEL_STYLES from transformers.integrations.tensor_parallel — a
+    # symbol absent in transformers 4.51. plain load_state_dict has no such
+    # version coupling. Doing it on CPU also costs no VRAM.
+    lora_sd = {k: v.detach().cpu() for k, v in student.state_dict().items() if "lora_" in k}
+    if not any("lora_B" in k for k in lora_sd):
+        raise RuntimeError("[sync] no lora_B weights found in student state_dict")
 
     # Must rebuild the SAME backbone the student trains on. The old code loaded
     # a pristine base here, so SFT was dropped from every generation snapshot.
     temp_base = load_base_backbone(args)
-    temp_peft = PeftModel.from_pretrained(temp_base, str(LORA_TEMP_PATH))
+    temp_peft = get_peft_model(temp_base, student.peft_config["default"])
+    _, unexpected = temp_peft.load_state_dict(lora_sd, strict=False)
+    stray = [k for k in unexpected if "lora_" in k]
+    if stray:
+        raise RuntimeError(f"[sync] LoRA keys did not match backbone: {stray[:3]}")
     merged = temp_peft.merge_and_unload()
 
     tmp_dest = dest.parent / (dest.name + "_tmp")
