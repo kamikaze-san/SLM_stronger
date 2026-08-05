@@ -131,10 +131,38 @@ def check_correct(response: str, example: dict) -> bool:
 
 # ── Prompt ─────────────────────────────────────────────────────────────────────
 
-def build_prompt(tokenizer: Any, question: str, no_think: bool) -> str:
+def build_user_prompt(example: dict) -> str:
+    """Must match eval_baseline.py's make_*_examples() exactly.
+
+    Previously training passed the bare question while eval added a format
+    instruction, so RL optimised a prompt distribution that never occurs at
+    eval time.
+    """
+    q = example["question"]
+    bench = example["benchmark"]
+    if bench == "gsm8k":
+        return (f"Question: {q}\n\n"
+                "Show your reasoning, then on the last line write only: Answer: [number]")
+    if bench == "strategyqa":
+        return (f"Question: {q}\n\n"
+                "Think about what facts you need to answer this. Work through the reasoning, "
+                "then commit to a final answer. Do not hedge — give your best judgment. "
+                "On the last line write only: Answer: Yes or Answer: No")
+    if bench == "mmlu":
+        # zpd_filter.py stored only the bare stem; the A/B/C/D options were
+        # never persisted, so these are unanswerable. Excluded by default via
+        # --exclude-benchmarks. Reaching here means that filter was disabled.
+        raise ValueError(
+            "MMLU training items have no answer choices (see zpd_filter.py). "
+            "Keep --exclude-benchmarks mmlu, or rebuild the options first."
+        )
+    raise ValueError(f"unknown benchmark: {bench}")
+
+
+def build_prompt(tokenizer: Any, example: dict, no_think: bool) -> str:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": question},
+        {"role": "user", "content": build_user_prompt(example)},
     ]
     kwargs: dict[str, Any] = {"tokenize": False, "add_generation_prompt": True}
     if no_think:
@@ -156,13 +184,24 @@ def get_eos_ids(tokenizer: Any) -> list[int]:
 
 # ── Model loading ──────────────────────────────────────────────────────────────
 
-def load_student(args: argparse.Namespace, resume_ckpt: Path | None) -> Any:
-    base = AutoModelForCausalLM.from_pretrained(
+def use_sft(args: argparse.Namespace) -> bool:
+    return (not args.no_sft) and args.sft_adapter is not None and args.sft_adapter.exists()
+
+
+def load_base_backbone(args: argparse.Namespace) -> Any:
+    """Base model with SFT folded in (if used). The backbone all adapters sit on."""
+    model = AutoModelForCausalLM.from_pretrained(
         args.student, torch_dtype=torch.bfloat16, trust_remote_code=True
     )
-    if resume_ckpt is None and args.sft_adapter and args.sft_adapter.exists():
-        print(f"Merging SFT LoRA from {args.sft_adapter} ...")
-        base = PeftModel.from_pretrained(base, str(args.sft_adapter)).merge_and_unload()
+    if use_sft(args):
+        model = PeftModel.from_pretrained(model, str(args.sft_adapter)).merge_and_unload()
+    return model
+
+
+def load_student(args: argparse.Namespace, resume_ckpt: Path | None) -> Any:
+    # NOTE: the SFT merge must happen on resume too. The old code guarded this
+    # with `resume_ckpt is None`, so resumed runs silently trained on bare base.
+    base = load_base_backbone(args)
 
     config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
@@ -188,28 +227,41 @@ def load_student(args: argparse.Namespace, resume_ckpt: Path | None) -> Any:
 
 
 def save_merged_for_vllm(student: Any, args: argparse.Namespace, dest: Path) -> bool:
-    try:
-        student.save_pretrained(str(LORA_TEMP_PATH))
+    """Write base(+SFT)+current adapter to dest, for vLLM to generate from.
 
-        temp_base = AutoModelForCausalLM.from_pretrained(
-            args.student, torch_dtype=torch.bfloat16, trust_remote_code=True
+    Raises on failure. It previously swallowed the exception and returned False,
+    which left a stale snapshot in place — so vLLM kept generating from step-0
+    weights for entire runs while training silently continued.
+    """
+    if shutil.disk_usage(str(dest.parent)).free < 12 * 1024**3:
+        raise RuntimeError(
+            f"[sync] refusing to write: <12GB free on {dest.parent}. "
+            "Staging a merged copy needs ~2x the model size; a failed write here "
+            "silently freezes the generation policy."
         )
-        temp_peft = PeftModel.from_pretrained(temp_base, str(LORA_TEMP_PATH))
-        merged = temp_peft.merge_and_unload()
 
-        tmp_dest = dest.parent / (dest.name + "_tmp")
-        merged.save_pretrained(str(tmp_dest))
-        del temp_base, temp_peft, merged
-        torch.cuda.empty_cache()
+    student.save_pretrained(str(LORA_TEMP_PATH))
 
-        if dest.exists():
-            shutil.rmtree(str(dest))
-        shutil.move(str(tmp_dest), str(dest))
-        return True
-    except Exception as e:
-        print(f"[sync] save_merged_for_vllm failed: {e}")
-        torch.cuda.empty_cache()
-        return False
+    # Must rebuild the SAME backbone the student trains on. The old code loaded
+    # a pristine base here, so SFT was dropped from every generation snapshot.
+    temp_base = load_base_backbone(args)
+    temp_peft = PeftModel.from_pretrained(temp_base, str(LORA_TEMP_PATH))
+    merged = temp_peft.merge_and_unload()
+
+    tmp_dest = dest.parent / (dest.name + "_tmp")
+    if tmp_dest.exists():
+        shutil.rmtree(str(tmp_dest))
+    merged.save_pretrained(str(tmp_dest))
+    del temp_base, temp_peft, merged
+    torch.cuda.empty_cache()
+
+    if not (tmp_dest / "config.json").exists():
+        raise RuntimeError(f"[sync] merged save produced no config.json in {tmp_dest}")
+
+    if dest.exists():
+        shutil.rmtree(str(dest))
+    shutil.move(str(tmp_dest), str(dest))
+    return True
 
 
 def load_vllm(args: argparse.Namespace, weights_path: Path) -> LLM:
@@ -236,16 +288,7 @@ def sync_vllm(
         del vllm_model
         torch.cuda.empty_cache()
 
-    saved = save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)
-    if not saved:
-        print("[sync] Merge failed, skipping reload.")
-        if SYNC_WEIGHTS_PATH.exists():
-            try:
-                return load_vllm(args, SYNC_WEIGHTS_PATH)
-            except Exception:
-                torch.cuda.empty_cache()
-                return None
-        return None
+    save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)   # raises on failure
 
     try:
         new_vllm = load_vllm(args, SYNC_WEIGHTS_PATH)
@@ -319,6 +362,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--student", default="Qwen/Qwen3-1.7B")
     parser.add_argument("--sft-adapter", type=Path, default=Path("checkpoints/sft_coldstart/final"))
+    parser.add_argument("--no-sft", action="store_true",
+                        help="Train directly on base, ignoring --sft-adapter (experiment A).")
+    parser.add_argument("--exclude-benchmarks", nargs="*", default=["mmlu"],
+                        help="Benchmarks dropped from TRAINING. mmlu is excluded by default "
+                             "because zpd_filter.py did not persist the A/B/C/D options. "
+                             "Pass an empty list to disable.")
     parser.add_argument("--train-data", type=Path, default=Path("data/zpd_filtered/all_zpd.jsonl"))
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/grpo"))
     parser.add_argument("--max-steps", type=int, default=500,
@@ -352,7 +401,14 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     questions = load_jsonl(args.train_data)
-    print(f"Loaded {len(questions)} ZPD questions")
+    n_all = len(questions)
+    if args.exclude_benchmarks:
+        questions = [q for q in questions if q["benchmark"] not in args.exclude_benchmarks]
+        print(f"Excluded {n_all - len(questions)} items from {args.exclude_benchmarks}")
+    if not questions:
+        raise SystemExit("No training questions left after --exclude-benchmarks.")
+    print(f"Loaded {len(questions)} ZPD questions (of {n_all})")
+    print(f"Backbone: base{'+SFT' if use_sft(args) else ' only (--no-sft)'}")
     print(f"Each step: {args.questions_per_step} questions x {args.num_rollouts} rollouts "
           f"= {args.questions_per_step * args.num_rollouts} generations")
 
@@ -372,10 +428,11 @@ def main() -> None:
     print(f"Loading student: {args.student}")
     student = load_student(args, resume_ckpt)
 
+    # Always write fresh. The old `if not config.json exists` guard meant a
+    # restarted run silently adopted the previous run's snapshot.
     print("\nPreparing initial vLLM weights ...")
     SYNC_WEIGHTS_PATH.mkdir(parents=True, exist_ok=True)
-    if not (SYNC_WEIGHTS_PATH / "config.json").exists():
-        save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)
+    save_merged_for_vllm(student, args, SYNC_WEIGHTS_PATH)
     tokenizer.save_pretrained(str(SYNC_WEIGHTS_PATH))
 
     print(f"\nLoading vLLM (gpu_memory_utilization={args.vllm_gpu_mem}) ...")
@@ -427,7 +484,7 @@ def main() -> None:
         batch_qs = [random.choice(questions) for _ in range(args.questions_per_step)]
         prompts: list[str] = []
         for q in batch_qs:
-            prompts.extend([build_prompt(tokenizer, q["question"], args.no_think)] * args.num_rollouts)
+            prompts.extend([build_prompt(tokenizer, q, args.no_think)] * args.num_rollouts)
 
         if vllm_model is None:
             vllm_model = sync_vllm(student, None, args, opt_step)
