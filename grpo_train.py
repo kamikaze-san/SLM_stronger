@@ -377,13 +377,16 @@ def policy_gradient_loss(
     full_ids: torch.Tensor,
     prompt_len: int,
     advantage: float,
-) -> torch.Tensor:
-    """-A * mean log pi(generated tokens).
+    kl_coef: float = 0.0,
+) -> tuple[torch.Tensor, float]:
+    """-A * mean log pi(generated tokens), optionally + kl_coef * KL(ref || pi).
 
     One optimizer step per generation batch means the policy is unchanged while
     the batch is consumed, so the PPO importance ratio is exactly 1 and the
     clipped surrogate reduces to this. Length-normalised so long rollouts do not
     dominate.
+
+    Returns (loss, kl_value) where kl_value is 0.0 when kl_coef <= 0.
     """
     device = next(student.parameters()).device
     input_ids = full_ids.unsqueeze(0).to(device)
@@ -392,14 +395,31 @@ def policy_gradient_loss(
     gen_start = prompt_len - 1
     gen_end = seq_len - 1
     if gen_start >= gen_end:
-        return torch.zeros((), device=device, requires_grad=True)
+        return torch.zeros((), device=device, requires_grad=True), 0.0
 
     logits = student(input_ids).logits[0, gen_start:gen_end]
     targets = full_ids[prompt_len:].to(device)
 
     log_probs = F.log_softmax(logits, dim=-1)
     token_logp = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    return -advantage * token_logp.mean()
+    pg = -advantage * token_logp.mean()
+
+    if kl_coef <= 0.0:
+        return pg, 0.0
+
+    # Reference = the adapter switched off, i.e. the frozen backbone the run
+    # started from. LoRA is additive, so disable_adapter() gives base logits
+    # from the same weights — no second model, no extra VRAM, one extra forward.
+    with torch.no_grad():
+        with student.disable_adapter():
+            ref_logits = student(input_ids).logits[0, gen_start:gen_end]
+        ref_log_probs = F.log_softmax(ref_logits, dim=-1)
+
+    # Forward KL(ref || pi): reported to retain prior capabilities better than
+    # the reverse direction (arxiv 2608.01743). Expectation is under the frozen
+    # reference, so it penalises dropping mass the base model placed somewhere.
+    kl = (ref_log_probs.exp() * (ref_log_probs - log_probs)).sum(-1).mean()
+    return pg + kl_coef * kl, float(kl.detach())
 
 
 # ── Argument parsing ───────────────────────────────────────────────────────────
@@ -431,6 +451,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--logging-steps", type=int, default=5)
     parser.add_argument("--warmup-steps", type=int, default=25)
     parser.add_argument("--vllm-gpu-mem", type=float, default=0.45)
+    parser.add_argument("--kl-coef", type=float, default=0.0,
+                        help="Coefficient on forward KL(ref||pi) against the frozen backbone. "
+                             "0 disables (DAPO-style). Typical anchored values 0.01-0.04. "
+                             "Costs one extra forward pass per rollout.")
     parser.add_argument("--temperature", type=float, default=1.0,
                         help="Higher than eval on purpose: exploration is what surfaces rare successes.")
     parser.add_argument("--seed", type=int, default=42)
@@ -522,7 +546,9 @@ def main() -> None:
 
     log_path = args.output_dir / "grpo_log.jsonl"
     window = {"reward_sum": 0.0, "n_rollouts": 0, "groups": 0,
-              "dead_groups": 0, "loss_sum": 0.0, "n_backward": 0}
+              "dead_groups": 0, "loss_sum": 0.0, "n_backward": 0, "kl_sum": 0.0}
+    t_start = time.perf_counter()
+    cum_rollouts = 0
     pbar = tqdm(total=args.max_steps, initial=opt_step, desc="GRPO")
 
     while opt_step < args.max_steps:
@@ -540,6 +566,7 @@ def main() -> None:
         outputs = vllm_model.generate(prompts, sampling_params)
         gen_time = time.perf_counter() - t_gen
         total_gen_tokens = sum(len(o.outputs[0].token_ids) for o in outputs)
+        cum_rollouts += len(outputs)
 
         optimizer.zero_grad()
         n_backward = 0
@@ -573,13 +600,15 @@ def main() -> None:
             for c, adv in zip(completions, advantages):
                 full_ids = torch.tensor(prompt_ids + list(c.token_ids))
                 try:
-                    loss = policy_gradient_loss(student, full_ids, len(prompt_ids), adv)
+                    loss, kl_ref = policy_gradient_loss(
+                        student, full_ids, len(prompt_ids), adv, args.kl_coef)
                     (loss / denom).backward()
                 except torch.cuda.OutOfMemoryError:
                     torch.cuda.empty_cache()
                     print("[OOM] rollout skipped, cache cleared.")
                     continue
                 window["loss_sum"] += loss.item()
+                window["kl_sum"] += kl_ref
                 n_backward += 1
 
         if n_backward == 0:
@@ -599,18 +628,25 @@ def main() -> None:
         if opt_step % args.logging_steps == 0:
             mean_reward = window["reward_sum"] / max(1, window["n_rollouts"])
             dead_rate = window["dead_groups"] / max(1, window["groups"])
+            mean_kl = window["kl_sum"] / max(1, window["n_backward"])
             log_row = {
                 "step": opt_step,
                 "mean_reward": round(mean_reward, 4),
                 "dead_group_rate": round(dead_rate, 3),
                 "loss": round(window["loss_sum"] / max(1, window["n_backward"]), 4),
+                "kl_to_ref": round(mean_kl, 5),
                 "lr": optimizer.param_groups[0]["lr"],
                 "gen_tok_per_sec": round(total_gen_tokens / max(gen_time, 1e-6), 1),
+                "elapsed_s": round(time.perf_counter() - t_start, 1),
+                "cum_rollouts": cum_rollouts,
             }
             append_jsonl(log_path, log_row)
-            pbar.set_postfix(reward=f"{mean_reward:.3f}", dead=f"{dead_rate:.1%}")
+            postfix = {"reward": f"{mean_reward:.3f}", "dead": f"{dead_rate:.1%}"}
+            if args.kl_coef > 0:
+                postfix["kl"] = f"{mean_kl:.4f}"
+            pbar.set_postfix(**postfix)
             window = {"reward_sum": 0.0, "n_rollouts": 0, "groups": 0,
-                      "dead_groups": 0, "loss_sum": 0.0, "n_backward": 0}
+                      "dead_groups": 0, "loss_sum": 0.0, "n_backward": 0, "kl_sum": 0.0}
 
         if opt_step % args.save_steps == 0:
             ckpt = args.output_dir / f"step_{opt_step}"
