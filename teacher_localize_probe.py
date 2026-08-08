@@ -89,20 +89,43 @@ def _norm_map(text: str) -> tuple[str, list[int]]:
     return "".join(out), idx
 
 
-def extract_quote(raw: str) -> str:
-    """Pull the quoted span out of the teacher's reply.
+MAX_QUOTE_CHARS = 400          # a step is short; anything longer is commentary
 
-    With thinking enabled the reply is <think>...</think> then the tags, so we
-    take the LAST tagged block. If the model ignored the tags, fall back to the
-    longest line of the reply — a paraphrase there still often locates via the
-    fuzzy tier, which beats discarding the attempt outright.
-    """
+
+def extract_quote(raw: str) -> str:
+    """The <quote> block, if the teacher produced one and it is plausibly a span."""
     tagged = re.findall(r"<quote>(.*?)</quote>", raw, re.DOTALL)
-    if tagged:
-        return tagged[-1].strip()
-    after_think = re.split(r"</think>", raw, flags=re.IGNORECASE)[-1]
-    lines = [l.strip() for l in after_think.split("\n") if l.strip()]
-    return max(lines, key=len) if lines else ""
+    if not tagged:
+        return ""
+    q = tagged[-1].strip()
+    return q if len(q) <= MAX_QUOTE_CHARS else ""
+
+
+def longest_shared_run(rollout: str, reply: str, min_chars: int = 20) -> int | None:
+    """Offset of the longest verbatim run the reply shares with the rollout.
+
+    Last-resort locator, and the one that survives a badly-behaved teacher. If it
+    ignores the tags, rambles, or paraphrases around a quoted fragment, whatever
+    it *did* copy verbatim still points at a position. Only fails when nothing
+    substantial was copied at all.
+    """
+    import difflib
+    sm = difflib.SequenceMatcher(None, rollout, reply, autojunk=False)
+    m = sm.find_longest_match(0, len(rollout), 0, len(reply))
+    return m.a if m.size >= min_chars else None
+
+
+def locate_teacher_cut(rollout: str, raw: str) -> tuple[int | None, str]:
+    """Turn a teacher reply into a cut offset. Reports which route succeeded."""
+    quote = extract_quote(raw)
+    if quote:
+        off, tier = locate_span(rollout, quote)
+        if off is not None:
+            return off, tier
+    off = longest_shared_run(rollout, raw)
+    if off is not None:
+        return off, "inline-verbatim" if quote else "no-tags-inline"
+    return None, "failed"
 
 
 def locate_span(rollout: str, quote: str, min_ratio: float = 0.4,
@@ -208,8 +231,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--teacher-batch", type=int, default=8)
     p.add_argument("--teacher-think", action="store_true",
-                   help="Let the teacher think before answering. Safe here: the output is "
-                        "only a line number, so it cannot contaminate the student.")
+                   help="OFF by default, and leave it off. With thinking on, Qwen3-8B spent "
+                        "the whole token budget reasoning and never emitted the <quote> tags "
+                        "at all, so the reply was pure internal monologue. Use the teacher as "
+                        "an instruct model.")
     p.add_argument("--skip-solve-rate", action="store_true",
                    help="Skip measuring the teacher's unhinted solve rate (saves ~10min).")
     p.add_argument("--vllm-gpu-mem", type=float, default=0.2)
@@ -292,7 +317,7 @@ def main() -> None:
         for q, rollout in dead
     ]
     crit_out = teacher_generate(teacher, t_tok, crit_prompts,
-                                max_new=1536 if args.teacher_think else 160,
+                                max_new=3072 if args.teacher_think else 256,
                                 batch=args.teacher_batch, think=args.teacher_think)
 
     # ── stage 3: score both cuts with MC ──────────────────────────────────────
@@ -302,7 +327,7 @@ def main() -> None:
     tiers: dict[str, int] = {}
     for (q, rollout), raw in tqdm(list(zip(dead, crit_out)), desc="score"):
         quote = extract_quote(raw)
-        t_cut, tier = locate_span(rollout, quote)
+        t_cut, tier = locate_teacher_cut(rollout, raw)
         tiers[tier] = tiers.get(tier, 0) + 1
         if t_cut is not None:
             t_cut = P.snap_to_whitespace(rollout, t_cut)
