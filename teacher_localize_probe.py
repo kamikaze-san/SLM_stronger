@@ -126,18 +126,47 @@ def span_end(rollout: str, start: int, quote: str) -> int:
     return nl if nl != -1 else guess
 
 
+KEYS = ("last_correct", "last_correct_step", "quote")
+
+
 def extract_json_quote(raw: str) -> str:
-    """Pull last_correct out of a JSON reply. Tolerates thinking and fences."""
-    for m in reversed(list(re.finditer(r"\{[^{}]*\}", raw, re.DOTALL))):
+    """Pull last_correct out of a JSON reply. Tolerates thinking, fences, LaTeX.
+
+    Two passes are needed because student text is full of braces and backslashes:
+      1. scan for real JSON objects with raw_decode — handles nested braces that
+         a '\\{[^{}]*\\}' regex cannot.
+      2. if that finds nothing, regex the field value directly. LaTeX like
+         '\\frac{a}{b}' is not valid JSON escaping, so strict parsing fails on
+         exactly the replies we most need.
+    """
+    # Pass 1: raw regex. Deliberately BEFORE json.loads, because json unescaping
+    # turns LaTeX like \boxed / \frac / \times into control characters (\b, \f,
+    # \t) and we need the string byte-identical to match it back in the rollout.
+    for k in KEYS:
+        m = re.findall(rf'"{k}"\s*:\s*"(.*?)"\s*[,}}]', raw, re.DOTALL)
+        if m and len(m[-1].strip()) >= 8:
+            return m[-1].strip()
+
+    # Pass 2: proper JSON, for replies the regex misses (escaped quotes etc).
+    dec = json.JSONDecoder()
+    found = ""
+    i = 0
+    while True:
+        i = raw.find("{", i)
+        if i == -1:
+            break
         try:
-            obj = json.loads(m.group())
+            obj, end = dec.raw_decode(raw[i:])
         except json.JSONDecodeError:
+            i += 1
             continue
-        for k in ("last_correct", "last_correct_step", "quote"):
-            v = obj.get(k)
-            if isinstance(v, str) and len(v.strip()) >= 8:
-                return v.strip()
-    return ""
+        if isinstance(obj, dict):
+            for k in KEYS:
+                v = obj.get(k)
+                if isinstance(v, str) and len(v.strip()) >= 8:
+                    found = v.strip()          # keep the last valid one
+        i += max(1, end)
+    return found
 
 
 def locate_teacher_cut(rollout: str, raw: str, mode: str) -> tuple[int | None, str]:
@@ -283,6 +312,45 @@ def teacher_generate(
     return outs
 
 
+def api_localize(prompts: list[str], model: str, effort: str, workers: int,
+                 retries: int = 3) -> list[str]:
+    """Localise via an OpenAI-compatible endpoint (DeepSeek).
+
+    Thinking is returned in a separate `reasoning_content` field, so unlike the
+    local 8B the monologue cannot leak into the parsed answer — that was the
+    failure that produced empty quotes and runaway generations.
+    """
+    import os
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+    from openai import OpenAI
+
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        raise SystemExit("Set DEEPSEEK_API_KEY in the environment.")
+    client = OpenAI(api_key=key, base_url="https://api.deepseek.com")
+
+    def one(prompt: str) -> str:
+        for attempt in range(retries):
+            try:
+                r = client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}],
+                    reasoning_effort=effort,
+                    extra_body={"thinking": {"type": "enabled"}},
+                )
+                return r.choices[0].message.content or ""
+            except Exception as e:
+                if attempt == retries - 1:
+                    print(f"[api] giving up after {retries}: {e}")
+                    return ""
+                _time.sleep(2 * (attempt + 1))
+        return ""
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(tqdm(ex.map(one, prompts), total=len(prompts), desc="api"))
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -290,6 +358,14 @@ def parse_args() -> argparse.Namespace:
                    help="Merged student for vLLM. Falls back to base if absent.")
     p.add_argument("--student-fallback", default="Qwen/Qwen3-1.7B")
     p.add_argument("--teacher", default="Qwen/Qwen3-8B")
+    p.add_argument("--localizer", choices=["teacher", "api"], default="teacher",
+                   help="teacher: local Qwen3-8B. api: DeepSeek endpoint — no 8B is loaded, "
+                        "so vLLM gets the whole GPU. Needs DEEPSEEK_API_KEY.")
+    p.add_argument("--api-model", default="deepseek-v4-flash")
+    p.add_argument("--api-effort", default="high",
+                   help="reasoning_effort. Cheap enough at flash pricing to leave high.")
+    p.add_argument("--api-workers", type=int, default=8,
+                   help="Concurrent requests; 100 serial calls would be slow.")
     p.add_argument("--train-data", type=Path, default=Path("data/zpd_filtered/gsm8k_zpd.jsonl"))
     p.add_argument("--n-questions", type=int, default=100)
     p.add_argument("--screen-rollouts", type=int, default=8)
@@ -338,21 +414,26 @@ def main() -> None:
               for q in questions}
 
     # ── teacher first, so vLLM profiles the memory that is actually left ──────
-    print(f"\nLoading teacher: {args.teacher}")
-    t_tok = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
-    if t_tok.pad_token is None:
-        t_tok.pad_token = t_tok.eos_token
-    t_tok.padding_side = "left"
-    teacher = AutoModelForCausalLM.from_pretrained(
-        args.teacher, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
-    teacher.eval()
-    dmap = getattr(teacher, "hf_device_map", {})
-    offloaded = [k for k, v in dmap.items() if v in ("cpu", "disk")]
-    if offloaded:
-        print(f"[WARN] {len(offloaded)} teacher modules offloaded to CPU/disk — will be slow. "
-              f"Lower --vllm-gpu-mem or free GPU memory.")
+    teacher = t_tok = None
+    if args.localizer == "teacher":
+        print(f"\nLoading teacher: {args.teacher}")
+        t_tok = AutoTokenizer.from_pretrained(args.teacher, trust_remote_code=True)
+        if t_tok.pad_token is None:
+            t_tok.pad_token = t_tok.eos_token
+        t_tok.padding_side = "left"
+        teacher = AutoModelForCausalLM.from_pretrained(
+            args.teacher, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
+        teacher.eval()
+        dmap = getattr(teacher, "hf_device_map", {})
+        offloaded = [k for k, v in dmap.items() if v in ("cpu", "disk")]
+        if offloaded:
+            print(f"[WARN] {len(offloaded)} teacher modules offloaded to CPU/disk — will be "
+                  f"slow. Lower --vllm-gpu-mem or free GPU memory.")
+        else:
+            print("Teacher fully on GPU.")
     else:
-        print("Teacher fully on GPU.")
+        print(f"\nLocaliser: {args.api_model} via API (no local teacher, GPU is all vLLM)")
+        args.skip_solve_rate = True      # solve rate gates a LOCAL kl target; n/a here
 
     student_path = args.student if Path(args.student).exists() else args.student_fallback
     print(f"\nLoading student into vLLM: {student_path}")
@@ -394,9 +475,13 @@ def main() -> None:
                     gt=q["ground_truth"], attempt=rollout)
         for q, rollout in dead
     ]
-    crit_out = teacher_generate(teacher, t_tok, crit_prompts,
-                                max_new=3072 if think else 256,
-                                batch=args.teacher_batch, think=think)
+    if args.localizer == "api":
+        crit_out = api_localize(crit_prompts, args.api_model, args.api_effort,
+                                args.api_workers)
+    else:
+        crit_out = teacher_generate(teacher, t_tok, crit_prompts,
+                                    max_new=3072 if think else 256,
+                                    batch=args.teacher_batch, think=think)
 
     # ── stage 3: score both cuts with MC ──────────────────────────────────────
     print("\nScoring teacher cut vs fixed cut with MC ...")
