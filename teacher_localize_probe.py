@@ -115,13 +115,51 @@ def longest_shared_run(rollout: str, reply: str, min_chars: int = 20) -> int | N
     return m.a if m.size >= min_chars else None
 
 
-def locate_teacher_cut(rollout: str, raw: str) -> tuple[int | None, str]:
-    """Turn a teacher reply into a cut offset. Reports which route succeeded."""
-    quote = extract_quote(raw)
+def span_end(rollout: str, start: int, quote: str) -> int:
+    """End of the located span, so we can cut AFTER a last-correct step."""
+    if rollout[start:start + len(quote)] == quote:
+        return start + len(quote)
+    # normalized/fuzzy match: walk forward over roughly the quote's length,
+    # then extend to the end of the line so we never stop mid-sentence.
+    guess = min(len(rollout), start + len(quote))
+    nl = rollout.find("\n", guess)
+    return nl if nl != -1 else guess
+
+
+def extract_json_quote(raw: str) -> str:
+    """Pull last_correct out of a JSON reply. Tolerates thinking and fences."""
+    for m in reversed(list(re.finditer(r"\{[^{}]*\}", raw, re.DOTALL))):
+        try:
+            obj = json.loads(m.group())
+        except json.JSONDecodeError:
+            continue
+        for k in ("last_correct", "last_correct_step", "quote"):
+            v = obj.get(k)
+            if isinstance(v, str) and len(v.strip()) >= 8:
+                return v.strip()
+    return ""
+
+
+def locate_teacher_cut(rollout: str, raw: str, mode: str) -> tuple[int | None, str]:
+    """Turn a teacher reply into a cut offset. Reports which route succeeded.
+
+    mode="last-correct": the teacher names the last CORRECT step and we cut just
+    after it. Structurally immune to the failure that sank the first attempt —
+    the teacher kept quoting the final wrong answer, and the final wrong answer
+    can never be the last correct step. Also biases the cut earlier, which is the
+    safe direction: a late cut poisons the prefix (V=0 guaranteed) while an early
+    cut merely gives a smaller head start.
+
+    mode="first-wrong": the original. Cut at the START of the quoted span.
+    """
+    quote = extract_json_quote(raw) if mode == "last-correct" else extract_quote(raw)
+    if not quote:                                    # tolerate the other format
+        quote = extract_quote(raw) or extract_json_quote(raw)
     if quote:
         off, tier = locate_span(rollout, quote)
         if off is not None:
-            return off, tier
+            cut = span_end(rollout, off, quote) if mode == "last-correct" else off
+            return cut, tier
     off = longest_shared_run(rollout, raw)
     if off is not None:
         return off, "inline-verbatim" if quote else "no-tags-inline"
@@ -130,7 +168,11 @@ def locate_teacher_cut(rollout: str, raw: str) -> tuple[int | None, str]:
 
 def locate_span(rollout: str, quote: str, min_ratio: float = 0.4,
                 min_chars: int = 20) -> tuple[int | None, str]:
-    """Char offset of `quote` in `rollout`, plus which match tier succeeded."""
+    """Char offset of `quote` in `rollout`, plus which match tier succeeded.
+
+    Returns the START of the span. Callers wanting the END (to cut *after* a
+    span) use span_end().
+    """
     quote = quote.strip()
     if len(quote) < 8:
         return None, "too-short"
@@ -181,6 +223,32 @@ Reply with the tags only, for example:
 <quote>the exact text goes here</quote>"""
 
 
+LAST_CORRECT_TEMPLATE = """A student solved this problem incorrectly. You are shown a correct reference solution.
+
+Problem: {question}
+
+Reference solution:
+{solution}
+Correct final answer: {gt}
+
+Student's attempt:
+{attempt}
+
+Compare the student's attempt against the reference solution. Identify the LAST step in \
+the student's attempt that is still completely correct — the final point before their \
+reasoning goes wrong.
+
+Then reply with a JSON object, and nothing after it:
+
+{{"last_correct": "<exact text of that step, copied character-for-character from the student's attempt>"}}
+
+Rules:
+- Copy the text VERBATIM from the student's attempt. Do not rephrase, reformat, or fix it.
+- Pick one step or sentence, not the whole attempt.
+- If the very first step is already wrong, use an empty string: {{"last_correct": ""}}
+"""
+
+
 SOLVE_TEMPLATE = """Question: {question}
 
 Show your reasoning, then on the last line write only: Answer: [number]"""
@@ -228,6 +296,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-continuations", type=int, default=8)
     p.add_argument("--fixed-frac", type=float, default=0.4,
                    help="The incumbent blind cut, re-measured here for a paired comparison.")
+    p.add_argument("--mode", choices=["last-correct", "first-wrong"], default="last-correct",
+                   help="last-correct: teacher names the last CORRECT step, cut just after it "
+                        "(JSON reply, thinking allowed). first-wrong: the original prompt, "
+                        "measured at 19.3%% usability vs 27%% for the blind cut.")
+    p.add_argument("--backoff-frac", type=float, default=0.15,
+                   help="Also score a cut pulled this fraction of the rollout EARLIER than "
+                        "the teacher's. Cutting late poisons the prefix (V=0 guaranteed); "
+                        "cutting early only shrinks the head start.")
     p.add_argument("--max-new-tokens", type=int, default=512)
     p.add_argument("--teacher-batch", type=int, default=8)
     p.add_argument("--teacher-think", action="store_true",
@@ -310,15 +386,17 @@ def main() -> None:
 
     # ── stage 2: teacher picks a cut ──────────────────────────────────────────
     print("\nTeacher localising first error (reference solution provided) ...")
+    tmpl = LAST_CORRECT_TEMPLATE if args.mode == "last-correct" else CRITIQUE_TEMPLATE
+    think = args.teacher_think or args.mode == "last-correct"
+    print(f"  mode={args.mode}  thinking={'on' if think else 'off'}")
     crit_prompts = [
-        CRITIQUE_TEMPLATE.format(
-            question=q["question"], solution=sol_of[str(q["question_id"])],
-            gt=q["ground_truth"], attempt=rollout)
+        tmpl.format(question=q["question"], solution=sol_of[str(q["question_id"])],
+                    gt=q["ground_truth"], attempt=rollout)
         for q, rollout in dead
     ]
     crit_out = teacher_generate(teacher, t_tok, crit_prompts,
-                                max_new=3072 if args.teacher_think else 256,
-                                batch=args.teacher_batch, think=args.teacher_think)
+                                max_new=3072 if think else 256,
+                                batch=args.teacher_batch, think=think)
 
     # ── stage 3: score both cuts with MC ──────────────────────────────────────
     print("\nScoring teacher cut vs fixed cut with MC ...")
@@ -326,14 +404,20 @@ def main() -> None:
     debug: list[dict] = []
     tiers: dict[str, int] = {}
     for (q, rollout), raw in tqdm(list(zip(dead, crit_out)), desc="score"):
-        quote = extract_quote(raw)
-        t_cut, tier = locate_teacher_cut(rollout, raw)
+        quote = (extract_json_quote(raw) if args.mode == "last-correct"
+                 else extract_quote(raw))
+        t_cut, tier = locate_teacher_cut(rollout, raw, args.mode)
         tiers[tier] = tiers.get(tier, 0) + 1
         if t_cut is not None:
             t_cut = P.snap_to_whitespace(rollout, t_cut)
         f_cut = P.snap_to_whitespace(rollout, int(args.fixed_frac * len(rollout)))
+        b_cut = None
+        if t_cut is not None and args.backoff_frac > 0:
+            b = int(t_cut - args.backoff_frac * len(rollout))
+            if b > 0:
+                b_cut = P.snap_to_whitespace(rollout, b)
 
-        cuts = sorted({c for c in (t_cut, f_cut) if c is not None and c > 0})
+        cuts = sorted({c for c in (t_cut, f_cut, b_cut) if c is not None and c > 0})
         vals = P.probe_values(llm, s_tok, q["question"], q["ground_truth"],
                               rollout, cuts, args.n_continuations, sp) if cuts else []
         v_of = dict(zip(cuts, vals))
@@ -346,6 +430,8 @@ def main() -> None:
             "teacher_v": v_of.get(t_cut) if t_cut is not None else None,
             "fixed_cut": f_cut,
             "fixed_v": v_of.get(f_cut),
+            "backoff_cut": b_cut,
+            "backoff_v": v_of.get(b_cut) if b_cut is not None else None,
         })
 
         if len(debug) < args.debug_dump:
@@ -377,7 +463,16 @@ def main() -> None:
     print(f"  fixed {args.fixed_frac:.0%} cut : {len(f_ok):>3}/{n} = {100*len(f_ok)/n:5.1f}%   <- incumbent")
     if t_scored:
         print(f"  teacher cut    : {len(t_ok):>3}/{len(t_scored)} = "
-              f"{100*len(t_ok)/len(t_scored):5.1f}%")
+              f"{100*len(t_ok)/len(t_scored):5.1f}%   (mode={args.mode})")
+    b_scored = [r for r in records if r.get("backoff_v") is not None]
+    if b_scored:
+        b_ok = [r for r in b_scored if r["backoff_v"] > 0]
+        print(f"  teacher -{args.backoff_frac:.0%}   : {len(b_ok):>3}/{len(b_scored)} = "
+              f"{100*len(b_ok)/len(b_scored):5.1f}%   (backed off earlier)")
+        union = [r for r in t_scored
+                 if (r["teacher_v"] or 0) > 0 or (r.get("backoff_v") or 0) > 0]
+        print(f"  either of those: {len(union):>3}/{len(t_scored)} = "
+              f"{100*len(union)/len(t_scored):5.1f}%   (best-of-2, costs 2x probing)")
     print(f"\nQUOTE MATCHING (how the teacher's verbatim span was located)")
     for t, c in sorted(tiers.items(), key=lambda kv: -kv[1]):
         print(f"  {t:<14} {c:>3}/{n}  ({100*c/n:5.1f}%)")
